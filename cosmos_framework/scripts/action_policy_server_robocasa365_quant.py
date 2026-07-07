@@ -33,9 +33,14 @@ import zmq
 from omegaconf import OmegaConf
 from torch import nn
 
-from cosmos_framework.data.vfm.action.domain_utils import get_domain_id
-from cosmos_framework.data.vfm.action.transforms import ActionTransformPipeline
-from cosmos_framework.data.vfm.joint_dataloader import IterativeJointDataLoader
+try:
+    from cosmos_framework.data.generator.action.domain_utils import get_domain_id
+    from cosmos_framework.data.generator.action.transforms import ActionTransformPipeline
+    from cosmos_framework.data.generator.joint_dataloader import IterativeJointDataLoader
+except ModuleNotFoundError:
+    from cosmos_framework.data.vfm.action.domain_utils import get_domain_id
+    from cosmos_framework.data.vfm.action.transforms import ActionTransformPipeline
+    from cosmos_framework.data.vfm.joint_dataloader import IterativeJointDataLoader
 from cosmos_framework.inference.args import OmniSetupArgs, OmniSetupOverrides
 from cosmos_framework.inference.common.init import init_output_dir
 from cosmos_framework.inference.inference import OmniInference
