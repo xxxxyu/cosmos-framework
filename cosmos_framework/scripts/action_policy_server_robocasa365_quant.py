@@ -208,6 +208,49 @@ def _infer_config_file(checkpoint_path: str) -> str:
     )
 
 
+_CONFIG_COMPAT_REPLACEMENTS = (
+    ("cosmos_framework.data.vfm", "cosmos_framework.data.generator"),
+    ("cosmos_framework.model.vfm", "cosmos_framework.model.generator"),
+    (
+        "cosmos_framework/model/vfm/vlm/qwen3_vl",
+        "cosmos_framework/model/generator/reasoner/qwen3_vl",
+    ),
+    (
+        "cosmos_framework.configs.base.defaults.vlm",
+        "cosmos_framework.configs.base.defaults.reasoner",
+    ),
+)
+
+
+def _materialize_compat_config(config_file: str, output_dir: str) -> str:
+    source = Path(config_file).expanduser()
+    text = source.read_text()
+    patched = text
+    applied: list[dict[str, str]] = []
+    for old, new in _CONFIG_COMPAT_REPLACEMENTS:
+        if old in patched:
+            patched = patched.replace(old, new)
+            applied.append({"old": old, "new": new})
+    if not applied:
+        return str(source)
+
+    out_dir = Path(output_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    compat_file = out_dir / f"{source.stem}.compat{source.suffix or '.yaml'}"
+    compat_file.write_text(patched)
+    log.info(
+        "[robocasa365-rldx-server] materialized compatible config "
+        f"source={str(source)!r} compat={str(compat_file)!r} replacements={len(applied)}"
+    )
+    _profile_event(
+        "compat_config",
+        source=str(source),
+        compat=str(compat_file),
+        replacements=applied,
+    )
+    return str(compat_file)
+
+
 def _build_data_batch_from_sample(sample: dict[str, Any]) -> dict[str, Any]:
     data_batch: dict[str, Any] = {}
     for key, value in sample.items():
@@ -337,8 +380,9 @@ class CosmosRoboCasa365Policy:
         init_start = time.perf_counter()
         torch.cuda.reset_peak_memory_stats()
         maybe_init_distributed()
+        self._runtime_config_file = _materialize_compat_config(cfg.config_file, cfg.output_dir)
         setup_start = time.perf_counter()
-        setup_args = self._build_setup_args(cfg)
+        setup_args = self._build_setup_args(cfg, self._runtime_config_file)
         _profile_event("build_setup_args", elapsed_ms=(time.perf_counter() - setup_start) * 1000.0)
         log.info(
             "[robocasa365-rldx-server] loading model "
@@ -354,7 +398,7 @@ class CosmosRoboCasa365Policy:
         assert isinstance(self.pipe.setup_args, OmniSetupArgs)
 
         transform_start = time.perf_counter()
-        dataset_cfg = _load_dataset_config(cfg.config_file)
+        dataset_cfg = _load_dataset_config(self._runtime_config_file)
         tokenizer_config = dataset_cfg.get("tokenizer_config")
         self.transform = ActionTransformPipeline(
             tokenizer_config=tokenizer_config,
@@ -885,11 +929,11 @@ class CosmosRoboCasa365Policy:
         )
         return input_scales
 
-    def _build_setup_args(self, cfg: ServerConfig) -> OmniSetupArgs:
+    def _build_setup_args(self, cfg: ServerConfig, config_file: str) -> OmniSetupArgs:
         overrides = OmniSetupOverrides.model_validate(
             {
                 "checkpoint_path": cfg.checkpoint_path,
-                "config_file": cfg.config_file,
+                "config_file": config_file,
                 "output_dir": cfg.output_dir,
                 "sampler": cfg.sampler,
                 "guardrails": cfg.guardrails,
