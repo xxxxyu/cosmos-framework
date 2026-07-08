@@ -61,7 +61,11 @@ The following are speed-only prototypes in
 | Backend | Description |
 |---|---|
 | `torch_scaled_mm_fp8_w8a8` | Tensor-wise FP8 W8A8; dynamic activation quantization in forward; `torch._scaled_mm` |
+| `torch_scaled_mm_fp8_w8a8_static_scale` | Tensor-wise FP8 W8A8; fixed activation scale; eager quantization; `torch._scaled_mm` |
 | `torch_scaled_mm_fp8_w8a8_kernel_only` | Tensor-wise FP8 W8A8; fixed benchmark activation is prequantized; times `torch._scaled_mm` only |
+| `vllm_cutlass_fp8_w8a8_dynamic` | Tensor-wise FP8 W8A8; vLLM `scaled_fp8_quant` dynamic activation quantization; vLLM CUTLASS scaled-mm |
+| `vllm_cutlass_fp8_w8a8_static_scale` | Tensor-wise FP8 W8A8; fixed activation scale; vLLM `scaled_fp8_quant`; vLLM CUTLASS scaled-mm |
+| `vllm_cutlass_fp8_w8a8_kernel_only` | Tensor-wise FP8 W8A8; fixed benchmark activation is prequantized; times vLLM CUTLASS scaled-mm only |
 | `torch_int8_mm_w8a8` | Tensor-wise INT8 W8A8; dynamic activation quantization in forward; `torch._int_mm` plus dequant |
 
 These use BF16 inputs and return BF16 outputs so they can be compared with the
@@ -71,6 +75,11 @@ robot policy backends.
 The `kernel_only` FP8 backend is even narrower: it stores a prequantized copy of
 the fixed benchmark input. It is only for separating FP8 matmul kernel speed
 from dynamic activation quantization overhead.
+
+The vLLM CUTLASS experiments call vLLM's low-level `_custom_ops` directly. The
+high-level `QuantFP8` class imports broader vLLM model/config dependencies in
+this local lightweight environment, so the benchmark avoids that extra import
+surface and uses `scaled_fp8_quant` plus `cutlass_scaled_mm`.
 
 ## Reproduce Real-Shape Benchmark
 
@@ -194,18 +203,94 @@ Interpretation:
   operator-level implementation study for fused/blockwise activation quant plus
   FP8 GEMM on the large MLP shapes.
 
+## vLLM CUTLASS and Static-Scale Follow-Up
+
+Run:
+
+```text
+/tmp/cosmos3_operator_microbench_attention_w8_top8_a8_vllm_cutlass_20260708_223859.json
+```
+
+This run adds:
+
+- PyTorch `_scaled_mm` with a fixed activation scale, simulating calibrated
+  static per-tensor activation scaling.
+- vLLM `scaled_fp8_quant` plus vLLM CUTLASS scaled-mm, both dynamic and static.
+- vLLM CUTLASS kernel-only, to compare CUTLASS GEMM speed against PyTorch
+  `_scaled_mm` without activation quantization.
+
+Weighted top-8 result:
+
+| Backend | Weighted candidate ms | Saving vs current top-8 policy |
+|---|---:|---:|
+| Current policy (`source_backend_class`) | 0.1419 | 0.0% |
+| vLLM Marlin W4A16 everywhere | 0.1392 | 1.9% |
+| vLLM Marlin W8A16 everywhere | 0.1435 | -1.1% |
+| PyTorch FP8 dynamic | 0.1439 | -1.4% |
+| PyTorch FP8 static-scale | 0.1156 | 18.6% |
+| PyTorch FP8 kernel-only | 0.0896 | 36.9% |
+| vLLM CUTLASS FP8 dynamic | 0.1422 | -0.2% |
+| vLLM CUTLASS FP8 static-scale | 0.1335 | 5.9% |
+| vLLM CUTLASS FP8 kernel-only | 0.1222 | 13.9% |
+
+Large MLP subset:
+
+| Count | Example | Shape | Current Marlin W4 ms | PyTorch FP8 dyn ms | PyTorch FP8 static ms | PyTorch FP8 kernel ms | vLLM CUTLASS dyn ms | vLLM CUTLASS static ms | vLLM CUTLASS kernel ms |
+|---:|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 576 | `mlp_moe_gen.gate_proj` | `518x4096->12288` | 0.3501 | 0.2333 | 0.2181 | 0.1945 | 0.2625 | 0.2558 | 0.2476 |
+| 288 | `mlp.gate_proj` | `82x4096->12288` | 0.0918 | 0.1052 | 0.0591 | 0.0435 | 0.0706 | 0.0642 | 0.0616 |
+| 288 | `mlp_moe_gen.down_proj` | `518x12288->4096` | 0.3289 | 0.2967 | 0.2809 | 0.2098 | 0.3596 | 0.3631 | 0.3290 |
+
+Weighted large MLP result:
+
+| Backend | Weighted candidate ms | Saving vs current Marlin W4 |
+|---|---:|---:|
+| Current Marlin W4 | 0.2802 | 0.0% |
+| PyTorch FP8 dynamic | 0.2171 | 22.5% |
+| PyTorch FP8 static-scale | 0.1941 | 30.7% |
+| PyTorch FP8 kernel-only | 0.1605 | 42.7% |
+| vLLM CUTLASS FP8 dynamic | 0.2388 | 14.8% |
+| vLLM CUTLASS FP8 static-scale | 0.2347 | 16.2% |
+| vLLM CUTLASS FP8 kernel-only | 0.2214 | 21.0% |
+
+If only the large MLP subset is replaced and other top-8 shapes keep the current
+policy, the top-8 weighted saving is:
+
+| Replacement for large MLP only | Top-8 saving | Rough end-to-end upper bound using prior 65.9% Marlin kernel share |
+|---|---:|---:|
+| PyTorch FP8 dynamic | 16.2% | 10.7% |
+| PyTorch FP8 static-scale | 22.1% | 14.5% |
+| PyTorch FP8 kernel-only | 30.7% | 20.2% |
+| vLLM CUTLASS FP8 dynamic | 10.6% | 7.0% |
+| vLLM CUTLASS FP8 static-scale | 11.7% | 7.7% |
+| vLLM CUTLASS FP8 kernel-only | 15.1% | 9.9% |
+
+Interpretation:
+
+- Static activation scale matters. Removing the runtime `amax` reduction improves
+  PyTorch FP8 on the large MLP subset from `22.5%` to `30.7%` saving vs Marlin
+  W4.
+- The current vLLM CUTLASS path is not the best 4090 backend for these shapes.
+  Even its kernel-only large-MLP result is slower than PyTorch `_scaled_mm`
+  kernel-only (`0.2214 ms` vs `0.1605 ms` weighted).
+- vLLM's low-level `scaled_fp8_quant` is useful as a mature static/dynamic
+  quantization reference, but its CUTLASS GEMM wrapper is not a drop-in speed
+  win for this Ada setup.
+- The best speed-only next candidate is calibrated static activation scale plus
+  PyTorch `_scaled_mm` for selected large MLP layers. This still needs action
+  parity validation because static activation scales can saturate outlier
+  inputs if calibration coverage is insufficient.
+
 ## Recommended Next Steps
 
-1. Test row-wise or block-wise FP8 scales if `torch._scaled_mm` supports a
-   layout compatible with the Cosmos shapes.
-2. Survey and benchmark mature fused A8 paths on RTX 4090, especially
-   CUTLASS/cuBLASLt/TensorRT-style FP8 GEMM integrations that avoid eager
-   activation quant overhead.
-3. If FP8 large-shape speed remains strong with fused activation quant,
-   prototype a per-shape runtime
-   policy for only the high-payoff MLP shapes.
-4. Only after speed is clearly positive, add activation calibration and compare
-   BF16 vs quantized actions on replay captures.
+1. Add calibration collection for per-layer static FP8 activation scales on
+   training/replay data and measure saturation rate.
+2. Compare action parity for large-MLP-only PyTorch FP8 static-scale against the
+   BF16/current-quant baselines.
+3. If parity is acceptable, prototype a per-shape runtime policy for only the
+   high-payoff MLP shapes.
+4. Keep vLLM CUTLASS as a reference, but do not prioritize it for 4090 unless a
+   newer kernel or layout variant beats PyTorch `_scaled_mm` on these shapes.
 5. W4A8 should be a separate investigation using a mature CUTLASS/TensorRT or
    PyTorch float4/int4 packed path; do not hand-roll it into the policy server
    without a standalone benchmark first.
