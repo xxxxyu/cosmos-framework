@@ -6,6 +6,9 @@ RoboCasa365 CloseFridge quantization work.
 For release testing and real-robot handoff notes, read
 `examples/robocasa365_quant/RELEASE_TESTING.md`.
 
+For experimental A8 backend exploration on a separate branch, read
+`examples/robocasa365_quant/A8_EXPLORATION.md`.
+
 It supports four fixed weight-only strategies:
 
 | Strategy | Plan | M13 success | Direct replay peak alloc |

@@ -379,6 +379,74 @@ class VllmAllSparkW8A16Linear(nn.Module):
         return out.reshape(x.shape[:-1] + (self.size_n,)).to(torch.bfloat16)
 
 
+class TorchScaledMMFp8W8A8Linear(nn.Module):
+    """Speed-only tensor-wise FP8 W8A8 prototype using torch._scaled_mm.
+
+    This is not a calibrated deployment backend. It dynamically quantizes
+    activations each forward and stores a tensor-wise FP8 weight copy in the
+    column-major layout required by cuBLASLt on Ada.
+    """
+
+    def __init__(self, weight: torch.Tensor) -> None:
+        super().__init__()
+        if not torch.cuda.is_available() or weight.device.type != "cuda":
+            raise RuntimeError("torch._scaled_mm FP8 backend requires CUDA tensors")
+        if not hasattr(torch, "float8_e4m3fn") or not hasattr(torch, "_scaled_mm"):
+            raise RuntimeError("torch._scaled_mm FP8 backend requires torch.float8_e4m3fn and torch._scaled_mm")
+        self.size_n, self.size_k = weight.shape
+        self.fp8_max = 448.0
+        weight_kn = weight.detach().to(torch.bfloat16).t().contiguous()
+        scale_b = (weight_kn.abs().amax().float() / self.fp8_max).clamp(min=1e-8)
+        q_weight = (weight_kn / scale_b).clamp(-self.fp8_max, self.fp8_max).to(torch.float8_e4m3fn)
+        q_weight_col_major = q_weight.t().contiguous().t()
+        self.register_buffer("qweight_col_major", q_weight_col_major, persistent=False)
+        self.register_buffer("scale_b", scale_b.reshape(1), persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+        scale_a = (x_2d.abs().amax().float() / self.fp8_max).clamp(min=1e-8)
+        q_x = (x_2d / scale_a).clamp(-self.fp8_max, self.fp8_max).to(torch.float8_e4m3fn)
+        out = torch._scaled_mm(
+            q_x,
+            self.qweight_col_major,
+            scale_a=scale_a.reshape(1),
+            scale_b=self.scale_b,
+            out_dtype=torch.bfloat16,
+        )
+        return out.reshape(x.shape[:-1] + (self.size_n,)).to(torch.bfloat16)
+
+
+class TorchInt8MMW8A8Linear(nn.Module):
+    """Speed-only tensor-wise INT8 W8A8 prototype using torch._int_mm.
+
+    This is not a calibrated deployment backend. It dynamically quantizes
+    activations each forward, performs INT8xINT8->INT32 matmul, then dequantizes
+    through a separate pointwise operation.
+    """
+
+    def __init__(self, weight: torch.Tensor) -> None:
+        super().__init__()
+        if not torch.cuda.is_available() or weight.device.type != "cuda":
+            raise RuntimeError("torch._int_mm backend requires CUDA tensors")
+        if not hasattr(torch, "_int_mm"):
+            raise RuntimeError("torch._int_mm is not available")
+        self.size_n, self.size_k = weight.shape
+        self.int8_max = 127.0
+        weight_kn = weight.detach().to(torch.bfloat16).t().contiguous()
+        scale_b = (weight_kn.abs().amax().float() / self.int8_max).clamp(min=1e-8)
+        q_weight = torch.round(weight_kn / scale_b).clamp(-127, 127).to(torch.int8).contiguous()
+        self.register_buffer("qweight", q_weight, persistent=False)
+        self.register_buffer("scale_b", scale_b.reshape(1), persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+        scale_a = (x_2d.abs().amax().float() / self.int8_max).clamp(min=1e-8)
+        q_x = torch.round(x_2d / scale_a).clamp(-127, 127).to(torch.int8).contiguous()
+        out_i32 = torch._int_mm(q_x, self.qweight)
+        out = out_i32.to(torch.float32) * (scale_a * self.scale_b)
+        return out.reshape(x.shape[:-1] + (self.size_n,)).to(torch.bfloat16)
+
+
 def _make_torchao_linear(weight: torch.Tensor, mode: str) -> nn.Module:
     from torchao.quantization import Int4WeightOnlyConfig, Int8WeightOnlyConfig, quantize_
 
@@ -406,6 +474,10 @@ def _make_backend(name: str, weight: torch.Tensor) -> nn.Module:
         return VllmGptqMarlinW8A16Linear(weight)
     if name == "vllm_allspark_w8a16":
         return VllmAllSparkW8A16Linear(weight)
+    if name == "torch_scaled_mm_fp8_w8a8":
+        return TorchScaledMMFp8W8A8Linear(weight)
+    if name == "torch_int8_mm_w8a8":
+        return TorchInt8MMW8A8Linear(weight)
     raise ValueError(f"Unsupported backend {name!r}")
 
 
@@ -676,6 +748,8 @@ def main() -> None:
             "vllm_gptq_marlin_w4a16": "offline symmetric per-group W4 quantization; forward uses vLLM Marlin ops only",
             "vllm_gptq_marlin_w8a16": "offline symmetric per-channel W8 quantization; forward uses vLLM Marlin ops only",
             "vllm_allspark_w8a16": "offline symmetric per-channel W8 quantization; forward uses vLLM AllSpark ops; gated to 80 <= SM < 90",
+            "torch_scaled_mm_fp8_w8a8": "experimental speed-only tensor-wise FP8 W8A8; dynamic activation quantization; uses torch._scaled_mm",
+            "torch_int8_mm_w8a8": "experimental speed-only tensor-wise INT8 W8A8; dynamic activation quantization; uses torch._int_mm plus dequant",
             "storage_gb": "module parameter/buffer bytes only; excludes temporary original BF16 tensors held by harness",
         },
         "single_backend": [],
