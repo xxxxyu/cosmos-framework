@@ -14,6 +14,13 @@ export HOST="${HOST:-127.0.0.1}"
 export PORT="${PORT:-5577}"
 export REPLAY_LIMIT="${REPLAY_LIMIT:-32}"
 export SERVED_ACTION_STEPS="${SERVED_ACTION_STEPS:-8}"
+export ACTION_CHUNK_SIZE="${ACTION_CHUNK_SIZE:-32}"
+export NUM_STEPS="${NUM_STEPS:-4}"
+export GUIDANCE="${GUIDANCE:-3.0}"
+export SHIFT="${SHIFT:-5.0}"
+export RESOLUTION="${RESOLUTION:-256}"
+export CAMERA_SIZE="${CAMERA_SIZE:-256}"
+export VIEW_MODE="${VIEW_MODE:-concat3}"
 export SERVER_READY_TIMEOUT_SEC="${SERVER_READY_TIMEOUT_SEC:-900}"
 export RUN_DIR="${RUN_DIR:-/tmp/cosmos3_robocasa365_quant_replay_$(date +%Y%m%d_%H%M%S)}"
 export PYTHONPATH="$COSMOS_REPO:$COSMOS_REPO/packages/transformers-cosmos3/src:$COSMOS_REPO/packages/diffusers-cosmos3/src:$COSMOS_REPO/packages/vllm-cosmos3:${PYTHONPATH:-}"
@@ -43,7 +50,14 @@ fi
   --output-dir "$RUN_DIR/server" \
   --host "$HOST" \
   --port "$PORT" \
+  --guidance "$GUIDANCE" \
+  --num-steps "$NUM_STEPS" \
+  --shift "$SHIFT" \
+  --resolution "$RESOLUTION" \
+  --action-chunk-size "$ACTION_CHUNK_SIZE" \
   --served-action-steps "$SERVED_ACTION_STEPS" \
+  --camera-size "$CAMERA_SIZE" \
+  --view-mode "$VIEW_MODE" \
   --no-guardrails \
   --no-torch-compile \
   --quant-import-dir "$QUANT_ARTIFACT_DIR" \

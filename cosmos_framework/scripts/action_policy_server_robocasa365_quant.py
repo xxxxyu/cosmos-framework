@@ -191,6 +191,7 @@ class ServerConfig:
     raw_action_dim: int
     max_action_dim: int
     camera_size: int
+    view_mode: str
     guardrails: bool
     use_torch_compile: bool
     torchao_quant: str
@@ -426,10 +427,24 @@ def _to_chw_uint8(frame: np.ndarray, size: int) -> torch.Tensor:
     return resized.round().clamp_(0, 255).to(torch.uint8)
 
 
-def _compose_concat_view(left: np.ndarray, right: np.ndarray, wrist: np.ndarray, camera_size: int) -> torch.Tensor:
+def _compose_concat_view(
+    left: np.ndarray,
+    right: np.ndarray,
+    wrist: np.ndarray,
+    camera_size: int,
+    view_mode: str = "concat3",
+) -> torch.Tensor:
     wrist_chw = _to_chw_uint8(wrist, camera_size)
+    if view_mode == "wrist":
+        return wrist_chw
     left_chw = _to_chw_uint8(left, camera_size)
+    if view_mode == "wrist_left":
+        return torch.cat([wrist_chw, left_chw], dim=-2)
     right_chw = _to_chw_uint8(right, camera_size)
+    if view_mode == "wrist_left_right":
+        return torch.cat([wrist_chw, left_chw, right_chw], dim=-2)
+    if view_mode != "concat3":
+        raise ValueError(f"Unsupported view_mode={view_mode!r}")
     half = camera_size // 2
     left_half = F.interpolate(left_chw.unsqueeze(0).float(), size=(half, half), mode="bilinear", align_corners=False)[
         0
@@ -496,7 +511,8 @@ class CosmosRoboCasa365Policy:
             "[robocasa365-rldx-server] ready "
             f"resolution={cfg.resolution} fps={cfg.conditioning_fps} "
             f"chunk={cfg.action_chunk_size} served_steps={cfg.served_action_steps} "
-            f"raw_action_dim={cfg.raw_action_dim} max_action_dim={cfg.max_action_dim}"
+            f"raw_action_dim={cfg.raw_action_dim} max_action_dim={cfg.max_action_dim} "
+            f"view_mode={cfg.view_mode}"
         )
 
     def _apply_torchao_quantization(self, cfg: ServerConfig) -> None:
@@ -1050,7 +1066,13 @@ class CosmosRoboCasa365Policy:
         left = _extract_frame(observation, _VIDEO_KEY_CANDIDATES["left"], batch_idx)
         right = _extract_frame(observation, _VIDEO_KEY_CANDIDATES["right"], batch_idx)
         wrist = _extract_frame(observation, _VIDEO_KEY_CANDIDATES["wrist"], batch_idx)
-        image = _compose_concat_view(left=left, right=right, wrist=wrist, camera_size=self.cfg.camera_size)
+        image = _compose_concat_view(
+            left=left,
+            right=right,
+            wrist=wrist,
+            camera_size=self.cfg.camera_size,
+            view_mode=self.cfg.view_mode,
+        )
         video = torch.zeros(
             (3, self.cfg.action_chunk_size + 1, image.shape[-2], image.shape[-1]),
             dtype=torch.uint8,
@@ -1234,6 +1256,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--raw-action-dim", type=int, default=12)
     parser.add_argument("--max-action-dim", type=int, default=64)
     parser.add_argument("--camera-size", type=int, default=256)
+    parser.add_argument(
+        "--view-mode",
+        default="concat3",
+        choices=["concat3", "wrist", "wrist_left", "wrist_left_right"],
+        help="Camera composition for token-compression latency studies.",
+    )
     parser.add_argument("--guardrails", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--torch-compile", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--torchao-quant", choices=["none", "int8wo", "int4wo"], default="none")
@@ -1282,6 +1310,7 @@ def main() -> None:
         raw_action_dim=args.raw_action_dim,
         max_action_dim=args.max_action_dim,
         camera_size=args.camera_size,
+        view_mode=args.view_mode,
         guardrails=args.guardrails,
         use_torch_compile=args.torch_compile,
         torchao_quant=args.torchao_quant,

@@ -9,6 +9,9 @@ For release testing and real-robot handoff notes, read
 For experimental A8 backend exploration on a separate branch, read
 `examples/robocasa365_quant/A8_EXPLORATION.md`.
 
+For single-robot latency bottleneck and token-compression motivation results,
+read `examples/robocasa365_quant/LATENCY_MOTIVATION_STUDY.md`.
+
 It supports four fixed weight-only strategies:
 
 | Strategy | Plan | M13 success | Direct replay peak alloc |

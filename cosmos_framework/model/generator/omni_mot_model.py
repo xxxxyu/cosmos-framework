@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import collections
 import json
+import os
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 import numpy as np
@@ -61,6 +63,51 @@ from cosmos_framework.utils.generator.data_utils import get_vision_data_resoluti
 from cosmos_framework.utils.generator.dtensor_helper import DTensorFastEmaModelUpdater
 from cosmos_framework.utils.generator.model_weights_stats import WeightTrainingStat
 from cosmos_framework.utils.generator.parallelism import ParallelDims
+
+
+_DENOISER_PROFILE_JSONL = os.environ.get("COSMOS3_DENOISER_PROFILE_JSONL", "")
+
+
+def _denoiser_profile_event(event: str, **fields: object) -> None:
+    if not _DENOISER_PROFILE_JSONL:
+        return
+    record = {"event": event, "ts": time.time(), **fields}
+    if torch.cuda.is_available():
+        record |= {
+            "cuda_allocated_gb": torch.cuda.memory_allocated() / 1e9,
+            "cuda_reserved_gb": torch.cuda.memory_reserved() / 1e9,
+            "cuda_max_allocated_gb": torch.cuda.max_memory_allocated() / 1e9,
+            "cuda_max_reserved_gb": torch.cuda.max_memory_reserved() / 1e9,
+        }
+    path = Path(_DENOISER_PROFILE_JSONL)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        f.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def _sync_profile_elapsed_ms(start: float) -> float:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return (time.perf_counter() - start) * 1000.0
+
+
+def _profile_token_count(tokens: object) -> int | None:
+    if isinstance(tokens, torch.Tensor):
+        if tokens.ndim == 0:
+            return 1
+        if tokens.ndim == 1:
+            return int(tokens.shape[0])
+        return int(np.prod(tokens.shape[:-1]))
+    if isinstance(tokens, (list, tuple)):
+        total = 0
+        any_token = False
+        for item in tokens:
+            count = _profile_token_count(item)
+            if count is not None:
+                total += count
+                any_token = True
+        return total if any_token else None
+    return None
 
 
 class OmniMoTModel(ImaginaireModel):
@@ -2421,6 +2468,7 @@ class OmniMoTModel(ImaginaireModel):
             _align_device = None
 
         def velocity_fn(noise_x: list[torch.Tensor], timestep: torch.Tensor) -> list[torch.Tensor]:
+            velocity_start = time.perf_counter()
             # len(noise_x) == B, noise_x[i] is shape (D)
             # timestep is shape (B, 1)
             torch.compiler.cudagraph_mark_step_begin()
@@ -2431,8 +2479,9 @@ class OmniMoTModel(ImaginaireModel):
             # Expand timestep to (B, 1)
             timestep = timestep.repeat(len(noise_x), 1)
 
-            def _single_velocity_fn(tokens: list[list[int]], skip_text_tokens: bool):
-                return self._get_velocity(
+            def _single_velocity_fn(tokens: list[list[int]], skip_text_tokens: bool, profile_label: str = "velocity"):
+                start = time.perf_counter()
+                out = self._get_velocity(
                     net=net,
                     noise_x=noise_x,
                     timestep=timestep,
@@ -2441,6 +2490,17 @@ class OmniMoTModel(ImaginaireModel):
                     gen_data_clean=gen_data_clean,
                     skip_text_tokens=skip_text_tokens,
                 )
+                _denoiser_profile_event(
+                    "denoiser_forward",
+                    label=profile_label,
+                    elapsed_ms=_sync_profile_elapsed_ms(start),
+                    timestep=float(timestep[0].item()),
+                    batch_size=len(noise_x),
+                    noise_tokens=_profile_token_count(noise_x),
+                    text_tokens=_profile_token_count(tokens),
+                    skip_text_tokens=bool(skip_text_tokens),
+                )
+                return out
 
             needs_text_cfg = guidance != 1.0
             if needs_text_cfg and guidance_interval is not None:
@@ -2460,20 +2520,47 @@ class OmniMoTModel(ImaginaireModel):
 
             # Fast path: no text-CFG anywhere and no postprocess hook — single forward.
             if not _any_needs_text_cfg and velocity_postprocess is None:
-                return _single_velocity_fn(cond_tokens, skip_text_tokens=False)
+                out = _single_velocity_fn(cond_tokens, skip_text_tokens=False, profile_label="cond_no_cfg")
+                _denoiser_profile_event(
+                    "velocity_step",
+                    elapsed_ms=_sync_profile_elapsed_ms(velocity_start),
+                    timestep=float(timestep[0].item()),
+                    needs_text_cfg=bool(needs_text_cfg),
+                    any_needs_text_cfg=bool(_any_needs_text_cfg),
+                    has_postprocess=False,
+                )
+                return out
 
             # Fast path: only text-CFG and no postprocess — preserve the
             # cfgp-parallel branch so two-rank CFG parallelism stays available.
             if velocity_postprocess is None:
+                cfg_start = time.perf_counter()
                 cond_v, uncond_v = self._run_classifier_free_guidance(
                     cond_tokens=cond_tokens,
                     uncond_tokens=uncond_tokens,
                     skip_text_tokens_for_cfg=skip_text_tokens_for_cfg,
                     single_velocity_fn=_single_velocity_fn,
                 )
+                _denoiser_profile_event(
+                    "cfg_pair",
+                    elapsed_ms=_sync_profile_elapsed_ms(cfg_start),
+                    timestep=float(timestep[0].item()),
+                    needs_text_cfg=bool(needs_text_cfg),
+                    any_needs_text_cfg=bool(_any_needs_text_cfg),
+                    text_tokens_cond=_profile_token_count(cond_tokens),
+                    text_tokens_uncond=_profile_token_count(uncond_tokens),
+                )
                 if not needs_text_cfg:
                     # Peers needed CFG so we ran the uncond forward to keep
                     # FSDP allgather aligned; locally we still return cond.
+                    _denoiser_profile_event(
+                        "velocity_step",
+                        elapsed_ms=_sync_profile_elapsed_ms(velocity_start),
+                        timestep=float(timestep[0].item()),
+                        needs_text_cfg=bool(needs_text_cfg),
+                        any_needs_text_cfg=bool(_any_needs_text_cfg),
+                        has_postprocess=False,
+                    )
                     return cond_v
                 v_pred = [u_i + guidance * (c_i - u_i) for c_i, u_i in zip(cond_v, uncond_v)]
                 if normalize_cfg:
@@ -2481,16 +2568,36 @@ class OmniMoTModel(ImaginaireModel):
                         v_i * (torch.norm(c_i) / (torch.norm(v_i) + 1e-8)).clamp(min=0.0, max=1.0)
                         for v_i, c_i in zip(v_pred, cond_v)
                     ]
+                _denoiser_profile_event(
+                    "velocity_step",
+                    elapsed_ms=_sync_profile_elapsed_ms(velocity_start),
+                    timestep=float(timestep[0].item()),
+                    needs_text_cfg=bool(needs_text_cfg),
+                    any_needs_text_cfg=bool(_any_needs_text_cfg),
+                    has_postprocess=False,
+                )
                 return v_pred
 
             # Conditional forward, then per-step postprocess hook. Hook runs
             # sequentially; cfgp parallelism not used on this path.
-            cond_v_full = _single_velocity_fn(cond_tokens, skip_text_tokens=False)
+            cond_v_full = _single_velocity_fn(cond_tokens, skip_text_tokens=False, profile_label="cond")
             cond_v = velocity_postprocess(cond_v_full, noise_x, timestep)
 
-            uncond_v = _single_velocity_fn(uncond_tokens, skip_text_tokens=skip_text_tokens_for_cfg)
+            uncond_v = _single_velocity_fn(
+                uncond_tokens,
+                skip_text_tokens=skip_text_tokens_for_cfg,
+                profile_label="uncond",
+            )
             if not needs_text_cfg:
                 # Same alignment story as above for the postprocess branch.
+                _denoiser_profile_event(
+                    "velocity_step",
+                    elapsed_ms=_sync_profile_elapsed_ms(velocity_start),
+                    timestep=float(timestep[0].item()),
+                    needs_text_cfg=bool(needs_text_cfg),
+                    any_needs_text_cfg=bool(_any_needs_text_cfg),
+                    has_postprocess=True,
+                )
                 return cond_v
 
             v_pred = [u_i + guidance * (c_i - u_i) for c_i, u_i in zip(cond_v, uncond_v)]
@@ -2501,6 +2608,14 @@ class OmniMoTModel(ImaginaireModel):
                     for v_i, c_i in zip(v_pred, cond_v)
                 ]
 
+            _denoiser_profile_event(
+                "velocity_step",
+                elapsed_ms=_sync_profile_elapsed_ms(velocity_start),
+                timestep=float(timestep[0].item()),
+                needs_text_cfg=bool(needs_text_cfg),
+                any_needs_text_cfg=bool(_any_needs_text_cfg),
+                has_postprocess=True,
+            )
             return v_pred
 
         # Run sampler for all samples at once.
