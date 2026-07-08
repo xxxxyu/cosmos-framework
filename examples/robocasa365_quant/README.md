@@ -190,6 +190,23 @@ examples/robocasa365_quant/profile_direct_replay_4090.sh
 | `nsys` | CUDA kernel/API attribution and condensed category summary |
 | `ncu-marlin` | targeted Nsight Compute profile for a small number of Marlin kernels |
 
+Set `TORCH_COMPILE=1` only for model/graph-level experiments. The default is
+`TORCH_COMPILE=0` so operator-level and eager baseline profiles remain
+comparable.
+
+For quantized direct-load experiments, the default MoT compile path uses
+`fullgraph=True` and cannot trace Marlin custom ops. A graph-break experiment
+can be run with:
+
+```bash
+TORCH_COMPILE=1 \
+COSMOS3_MOT_COMPILE_FULLGRAPH=0 \
+COSMOS3_DYNAMO_DISABLE_QUANT_LINEAR=1 \
+examples/robocasa365_quant/profile_direct_replay_4090.sh
+```
+
+Treat this as a model/graph-level ablation, not an operator benchmark.
+
 For targeted Marlin kernel profiling:
 
 ```bash
@@ -217,6 +234,23 @@ kernel-internal metrics. When running the profiler under `sudo`, explicitly set
 
 ```bash
 NCU_BIN=/usr/local/cuda-12.4/bin/ncu PROFILE_TOOL=ncu-marlin ...
+```
+
+For operator-level benchmarking, run the profiling wrapper once with
+`LINEAR_SHAPE_PROFILE=1`. This writes `linear_shapes.jsonl`, a quantized-linear
+shape/call-count summary from the real replay:
+
+```bash
+LINEAR_SHAPE_PROFILE=1 \
+PROFILE_TOOL=none \
+examples/robocasa365_quant/profile_direct_replay_4090.sh
+
+python -m cosmos_framework.scripts.quant_backend_microbench \
+  --shape-file /path/to/profile_run/linear_shapes.jsonl \
+  --max-shapes 12 \
+  --backends bf16,vllm_gptq_marlin_w4a16,vllm_gptq_marlin_w8a16,vllm_allspark_w8a16 \
+  --chain none \
+  --output /tmp/cosmos3_quant_backend_microbench.json
 ```
 
 ## Rollout Gate

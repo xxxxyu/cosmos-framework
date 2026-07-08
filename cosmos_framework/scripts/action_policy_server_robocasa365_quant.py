@@ -13,6 +13,8 @@ from cosmos_framework.inference.common.init import init_script
 init_script()
 
 import argparse
+import atexit
+import math
 import importlib.util
 import io
 import json
@@ -21,6 +23,7 @@ import re
 import sys
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -75,7 +78,11 @@ _CONCAT_VIEW_DESCRIPTION = (
 )
 
 _PROFILE_JSONL = os.environ.get("COSMOS3_PROFILE_JSONL", "")
+_LINEAR_SHAPES_JSONL = os.environ.get("COSMOS3_LINEAR_SHAPES_JSONL", "")
+_DYNAMO_DISABLE_QUANT_LINEAR = os.environ.get("COSMOS3_DYNAMO_DISABLE_QUANT_LINEAR", "0") == "1"
 _PROFILE_LOCK = threading.Lock()
+_LINEAR_SHAPE_LOCK = threading.Lock()
+_LINEAR_SHAPE_COUNTS: Counter[tuple[str, str, int, int, int, str]] = Counter()
 
 
 def _cuda_mem() -> dict[str, float]:
@@ -103,10 +110,65 @@ def _profile_event(event: str, **fields: Any) -> None:
             f.write(json.dumps(record, sort_keys=True) + "\n")
 
 
+def _record_quant_linear_shape(name: str, backend_class: str, x: torch.Tensor, out_features: int) -> None:
+    if not _LINEAR_SHAPES_JSONL:
+        return
+    if not isinstance(x, torch.Tensor) or x.ndim == 0:
+        return
+    in_features = int(x.shape[-1])
+    backend = backend_class
+    batch_tokens = int(math.prod(x.shape[:-1])) if x.ndim > 1 else 1
+    key = (name, backend, batch_tokens, in_features, int(out_features), str(x.dtype).replace("torch.", ""))
+    with _LINEAR_SHAPE_LOCK:
+        _LINEAR_SHAPE_COUNTS[key] += 1
+
+
+def _flush_quant_linear_shapes() -> None:
+    if not _LINEAR_SHAPES_JSONL:
+        return
+    with _LINEAR_SHAPE_LOCK:
+        items = list(_LINEAR_SHAPE_COUNTS.items())
+        _LINEAR_SHAPE_COUNTS.clear()
+    if not items:
+        return
+    path = Path(_LINEAR_SHAPES_JSONL)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        for (name, backend_class, batch_tokens, in_features, out_features, dtype), count in sorted(items):
+            f.write(
+                json.dumps(
+                    {
+                        "event": "quant_linear_shape",
+                        "name": name,
+                        "backend_class": backend_class,
+                        "batch_tokens": batch_tokens,
+                        "in_features": in_features,
+                        "out_features": out_features,
+                        "input_dtype": dtype,
+                        "count": count,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+
+
+atexit.register(_flush_quant_linear_shapes)
+
+
 def _sync_elapsed_ms(start: float) -> float:
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     return (time.perf_counter() - start) * 1000.0
+
+
+def _maybe_disable_dynamo(fn: Any) -> Any:
+    if not _DYNAMO_DISABLE_QUANT_LINEAR:
+        return fn
+    try:
+        return torch._dynamo.disable(fn)
+    except Exception:
+        return fn
 
 
 @dataclass(frozen=True)
@@ -176,15 +238,24 @@ class MsgSerializer:
 
 
 class QuantLinearWithOptionalBias(nn.Module):
-    def __init__(self, backend: nn.Module, bias: torch.Tensor | None) -> None:
+    def __init__(self, backend: nn.Module, bias: torch.Tensor | None, name: str = "") -> None:
         super().__init__()
         self.backend = backend
+        self.profile_name = name
         if bias is None:
             self.bias = None
         else:
             self.bias = nn.Parameter(bias.detach().to(torch.bfloat16), requires_grad=False)
 
+    @_maybe_disable_dynamo
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _LINEAR_SHAPES_JSONL:
+            _record_quant_linear_shape(
+                self.profile_name,
+                type(self.backend).__name__,
+                x,
+                int(getattr(self.backend, "size_n", self.bias.numel() if self.bias is not None else -1)),
+            )
         y = self.backend(x)
         if self.bias is not None:
             y = y + self.bias
@@ -563,7 +634,7 @@ class CosmosRoboCasa365Policy:
                 backend = make_torchao_int8wo(linear)
             else:
                 raise ValueError(f"Unsupported quant backend {backend_name!r} for module {name}")
-            wrapped = QuantLinearWithOptionalBias(backend, linear.bias)
+            wrapped = QuantLinearWithOptionalBias(backend, linear.bias, name=name)
             bytes_after += sum(t.numel() * t.element_size() for t in list(wrapped.parameters()) + list(wrapped.buffers()))
             self._set_module(self.model, name, wrapped)
             counts[backend_name] = counts.get(backend_name, 0) + 1
@@ -652,7 +723,11 @@ class CosmosRoboCasa365Policy:
                 raise ValueError(f"Unsupported quant artifact format for {name}: {metadata.get('format')!r}")
             backend = self._make_marlin_backend_from_artifact(backend_module, metadata, payload, device)
             bias = payload.get("bias")
-            wrapped = QuantLinearWithOptionalBias(backend, bias.to(device=device) if isinstance(bias, torch.Tensor) else None)
+            wrapped = QuantLinearWithOptionalBias(
+                backend,
+                bias.to(device=device) if isinstance(bias, torch.Tensor) else None,
+                name=name,
+            )
             self._set_module(model, set_name, wrapped)
             counts[str(metadata["backend_class"])] = counts.get(str(metadata["backend_class"]), 0) + 1
             for value in payload.values():
@@ -1093,6 +1168,7 @@ class PolicyServer:
             return {"status": "ok", "message": "Server is running"}
         if endpoint == "kill":
             self.running = False
+            _flush_quant_linear_shapes()
             return {"status": "ok"}
         if endpoint == "get_modality_config":
             return self.policy.get_modality_config()

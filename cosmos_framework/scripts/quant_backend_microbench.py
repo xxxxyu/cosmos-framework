@@ -31,6 +31,14 @@ class LinearShape:
     out_features: int
 
 
+@dataclass(frozen=True)
+class LinearShapeSpec:
+    shape: LinearShape
+    count: int = 1
+    source_backend_class: str = ""
+    example_name: str = ""
+
+
 class Bf16Linear(nn.Module):
     def __init__(self, weight: torch.Tensor) -> None:
         super().__init__()
@@ -542,6 +550,83 @@ def _chain(shape: LinearShape, backend_a: str, backend_b: str, warmup: int, iter
     }
 
 
+def _load_shape_specs(path: Path, max_shapes: int) -> list[LinearShapeSpec]:
+    grouped: dict[tuple[int, int, int, str], dict[str, object]] = {}
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if record.get("event") not in {None, "quant_linear_shape"}:
+            continue
+        try:
+            batch_tokens = int(record["batch_tokens"])
+            in_features = int(record["in_features"])
+            out_features = int(record["out_features"])
+        except KeyError:
+            continue
+        if batch_tokens <= 0 or in_features <= 0 or out_features <= 0:
+            continue
+        backend_class = str(record.get("backend_class", ""))
+        key = (batch_tokens, in_features, out_features, backend_class)
+        entry = grouped.setdefault(
+            key,
+            {
+                "count": 0,
+                "example_name": str(record.get("name", "")),
+            },
+        )
+        entry["count"] = int(entry["count"]) + int(record.get("count", 1))
+    specs = [
+        LinearShapeSpec(
+            shape=LinearShape(batch_tokens, in_features, out_features),
+            count=int(entry["count"]),
+            source_backend_class=backend_class,
+            example_name=str(entry["example_name"]),
+        )
+        for (batch_tokens, in_features, out_features, backend_class), entry in grouped.items()
+    ]
+    specs.sort(key=lambda item: item.count, reverse=True)
+    return specs[:max_shapes] if max_shapes > 0 else specs
+
+
+def _weighted_single_backend_summary(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    grouped: dict[str, dict[str, float]] = {}
+    for row in rows:
+        if "error" in row:
+            continue
+        backend = str(row["backend"])
+        count = float(row.get("shape_count", 1))
+        entry = grouped.setdefault(
+            backend,
+            {
+                "weighted_candidate_ms": 0.0,
+                "weighted_ref_bf16_ms": 0.0,
+                "count": 0.0,
+                "shapes": 0.0,
+            },
+        )
+        entry["weighted_candidate_ms"] += float(row["candidate_ms"]) * count
+        entry["weighted_ref_bf16_ms"] += float(row["ref_bf16_ms"]) * count
+        entry["count"] += count
+        entry["shapes"] += 1.0
+    summary: list[dict[str, object]] = []
+    for backend, entry in sorted(grouped.items()):
+        count = max(entry["count"], 1.0)
+        cand = entry["weighted_candidate_ms"] / count
+        ref = entry["weighted_ref_bf16_ms"] / count
+        summary.append(
+            {
+                "backend": backend,
+                "weighted_avg_candidate_ms": cand,
+                "weighted_avg_ref_bf16_ms": ref,
+                "weighted_latency_ratio_vs_bf16": cand / ref if ref > 0 else None,
+                "total_shape_calls": int(entry["count"]),
+                "benchmarked_shapes": int(entry["shapes"]),
+            }
+        )
+    return summary
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True)
@@ -560,16 +645,33 @@ def main() -> None:
     parser.add_argument("--batch-tokens", type=int, default=256)
     parser.add_argument("--in-features", type=int, default=4096)
     parser.add_argument("--out-features", type=int, default=12288)
+    parser.add_argument("--shape-file", default="", help="Optional JSONL from COSMOS3_LINEAR_SHAPES_JSONL.")
+    parser.add_argument("--max-shapes", type=int, default=16, help="Top shape groups to benchmark when --shape-file is set.")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
-    shape = LinearShape(args.batch_tokens, args.in_features, args.out_features)
+    if args.shape_file:
+        shape_specs = _load_shape_specs(Path(args.shape_file), args.max_shapes)
+        if not shape_specs:
+            raise ValueError(f"No valid linear shape records found in {args.shape_file}")
+    else:
+        shape_specs = [LinearShapeSpec(LinearShape(args.batch_tokens, args.in_features, args.out_features))]
     results: dict[str, object] = {
         "device": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",
         "torch": torch.__version__,
         "cuda_capability": torch.cuda.get_device_capability() if torch.cuda.is_available() else None,
+        "shape_file": args.shape_file or None,
+        "shape_specs": [
+            {
+                "shape": spec.shape.__dict__,
+                "count": spec.count,
+                "source_backend_class": spec.source_backend_class,
+                "example_name": spec.example_name,
+            }
+            for spec in shape_specs
+        ],
         "notes": {
             "vllm_gptq_marlin_w4a16": "offline symmetric per-group W4 quantization; forward uses vLLM Marlin ops only",
             "vllm_gptq_marlin_w8a16": "offline symmetric per-channel W8 quantization; forward uses vLLM Marlin ops only",
@@ -580,31 +682,56 @@ def main() -> None:
         "mixed_chain": [],
     }
     backend_specs = [] if args.backends.strip().lower() in {"", "none", "null", "off"} else args.backends.split(",")
-    for backend in [item.strip() for item in backend_specs if item.strip()]:
-        try:
-            results["single_backend"].append(_one_backend(shape, backend, args.warmup, args.iters, args.seed))
-        except Exception as exc:
-            results["single_backend"].append(
-                {
-                    "backend": backend,
-                    "shape": shape.__dict__,
-                    "error": repr(exc),
-                }
-            )
-    chain_specs = [] if args.chain.strip().lower() in {"", "none", "null", "off"} else args.chain.split(",")
-    for spec in [item.strip() for item in chain_specs if item.strip()]:
-        backend_a, backend_b = spec.split(":", 1)
-        try:
-            results["mixed_chain"].append(_chain(shape, backend_a, backend_b, args.warmup, args.iters, args.seed))
-        except Exception as exc:
-            results["mixed_chain"].append(
-                {
-                    "backend_a": backend_a,
-                    "backend_b": backend_b,
-                    "shape": shape.__dict__,
-                    "error": repr(exc),
-                }
-            )
+    for shape_index, shape_spec in enumerate(shape_specs):
+        shape = shape_spec.shape
+        for backend in [item.strip() for item in backend_specs if item.strip()]:
+            try:
+                row = _one_backend(shape, backend, args.warmup, args.iters, args.seed + shape_index)
+                row.update(
+                    {
+                        "shape_count": shape_spec.count,
+                        "source_backend_class": shape_spec.source_backend_class,
+                        "example_name": shape_spec.example_name,
+                    }
+                )
+                results["single_backend"].append(row)
+            except Exception as exc:
+                results["single_backend"].append(
+                    {
+                        "backend": backend,
+                        "shape": shape.__dict__,
+                        "shape_count": shape_spec.count,
+                        "source_backend_class": shape_spec.source_backend_class,
+                        "example_name": shape_spec.example_name,
+                        "error": repr(exc),
+                    }
+                )
+        chain_specs = [] if args.chain.strip().lower() in {"", "none", "null", "off"} else args.chain.split(",")
+        for spec in [item.strip() for item in chain_specs if item.strip()]:
+            backend_a, backend_b = spec.split(":", 1)
+            try:
+                row = _chain(shape, backend_a, backend_b, args.warmup, args.iters, args.seed + shape_index)
+                row.update(
+                    {
+                        "shape_count": shape_spec.count,
+                        "source_backend_class": shape_spec.source_backend_class,
+                        "example_name": shape_spec.example_name,
+                    }
+                )
+                results["mixed_chain"].append(row)
+            except Exception as exc:
+                results["mixed_chain"].append(
+                    {
+                        "backend_a": backend_a,
+                        "backend_b": backend_b,
+                        "shape": shape.__dict__,
+                        "shape_count": shape_spec.count,
+                        "source_backend_class": shape_spec.source_backend_class,
+                        "example_name": shape_spec.example_name,
+                        "error": repr(exc),
+                    }
+                )
+    results["single_backend_weighted_summary"] = _weighted_single_backend_summary(results["single_backend"])
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

@@ -17,6 +17,8 @@ export SERVED_ACTION_STEPS="${SERVED_ACTION_STEPS:-8}"
 export SERVER_READY_TIMEOUT_SEC="${SERVER_READY_TIMEOUT_SEC:-900}"
 export SERVER_SHUTDOWN_TIMEOUT_SEC="${SERVER_SHUTDOWN_TIMEOUT_SEC:-60}"
 export PROFILE_TOOL="${PROFILE_TOOL:-none}" # none | nsys | ncu-marlin
+export LINEAR_SHAPE_PROFILE="${LINEAR_SHAPE_PROFILE:-0}"
+export TORCH_COMPILE="${TORCH_COMPILE:-0}"
 export NSYS_BIN="${NSYS_BIN:-nsys}"
 export NCU_BIN="${NCU_BIN:-ncu}"
 export NCU_KERNEL_NAME="${NCU_KERNEL_NAME:-regex:.*marlin::Marlin.*}"
@@ -30,6 +32,9 @@ export PYTHONPATH="$COSMOS_REPO:$COSMOS_REPO/packages/transformers-cosmos3/src:$
 
 mkdir -p "$RUN_DIR/server" "$RUN_DIR/replay"
 export COSMOS3_PROFILE_JSONL="$RUN_DIR/profile_events.jsonl"
+if [[ "$LINEAR_SHAPE_PROFILE" == "1" ]]; then
+  export COSMOS3_LINEAR_SHAPES_JSONL="${COSMOS3_LINEAR_SHAPES_JSONL:-$RUN_DIR/linear_shapes.jsonl}"
+fi
 
 validate_args=(--quant-artifact-dir "$QUANT_ARTIFACT_DIR")
 if [[ -n "${STRATEGY:-}" ]]; then
@@ -46,9 +51,13 @@ server_cmd=(
   --port "$PORT"
   --served-action-steps "$SERVED_ACTION_STEPS"
   --no-guardrails
-  --no-torch-compile
   --quant-import-dir "$QUANT_ARTIFACT_DIR"
 )
+if [[ "$TORCH_COMPILE" == "1" ]]; then
+  server_cmd+=(--torch-compile)
+else
+  server_cmd+=(--no-torch-compile)
+fi
 
 case "$PROFILE_TOOL" in
   none)
