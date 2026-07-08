@@ -17,10 +17,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+
+_BACKEND_BITS = {
+    "VllmGptqMarlinW4A16Linear": 4,
+    "VllmGptqMarlinW8A16Linear": 8,
+}
+_BACKEND_CLASSES = {
+    "vllm_gptq_marlin_w4a16": "VllmGptqMarlinW4A16Linear",
+    "vllm_gptq_marlin_w8a16": "VllmGptqMarlinW8A16Linear",
+}
+_SUPPORTED_FORMATS = {"vllm_marlin_wna16"}
 
 
 @dataclass(frozen=True)
@@ -147,6 +159,161 @@ def write_artifact_manifest(args: argparse.Namespace) -> None:
         "m13_success_rate": strategy.m13_success_rate,
     }
     (root / "cosmos3_quant_metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+
+
+def _require_string(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"quant artifact manifest field {field!r} must be a non-empty string")
+    return value
+
+
+def _backend_for_name(plan: list[dict[str, str]], name: str) -> str:
+    selected = "none"
+    for row in plan:
+        prefix = row.get("prefix", "")
+        if prefix and not name.startswith(prefix):
+            continue
+        name_regex = row.get("name_regex", "")
+        if name_regex and not re.search(name_regex, name):
+            continue
+        exclude_regex = row.get("exclude_regex", "")
+        if exclude_regex and re.search(exclude_regex, name):
+            continue
+        selected = row.get("backend", "none")
+    return selected
+
+
+def validate_quant_artifact(
+    quant_artifact_dir: str | Path,
+    *,
+    expected_strategy: str | None = None,
+    check_tensors: bool = False,
+) -> dict[str, Any]:
+    """Validate a packed quant artifact manifest before serving or replay.
+
+    The default check is intentionally metadata-only so it is safe to run in
+    CI and before large local replays. ``check_tensors=True`` additionally
+    verifies that each tensor file can be opened by ``torch.load``.
+    """
+
+    root = Path(quant_artifact_dir).expanduser()
+    manifest_path = root / "manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Missing quant artifact manifest: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text())
+    if not isinstance(manifest, dict):
+        raise TypeError(f"quant artifact manifest must be a dict, got {type(manifest)}")
+
+    schema_version = manifest.get("schema_version")
+    if schema_version != 1:
+        raise ValueError(f"Unsupported quant artifact schema_version={schema_version!r}; expected 1")
+
+    modules = manifest.get("modules")
+    if not isinstance(modules, list) or not modules:
+        raise TypeError(f"quant artifact manifest modules must be a non-empty list, got {type(modules)}")
+
+    expected_plan: list[dict[str, str]] | None = None
+    if expected_strategy is not None:
+        expected_plan = _strategy(expected_strategy).plan
+
+    metadata_path = root / "cosmos3_quant_metadata.json"
+    metadata: dict[str, Any] | None = None
+    if metadata_path.is_file():
+        loaded_metadata = json.loads(metadata_path.read_text())
+        if not isinstance(loaded_metadata, dict):
+            raise TypeError(f"quant artifact metadata must be a dict, got {type(loaded_metadata)}")
+        metadata = loaded_metadata
+        if expected_strategy is not None and metadata.get("strategy") != expected_strategy:
+            raise ValueError(
+                f"quant artifact strategy mismatch: expected {expected_strategy!r}, "
+                f"metadata has {metadata.get('strategy')!r}"
+            )
+
+    seen_names: set[str] = set()
+    seen_files: set[str] = set()
+    counts: dict[str, int] = {}
+    for idx, entry in enumerate(modules):
+        if not isinstance(entry, dict):
+            raise TypeError(f"quant artifact module entry {idx} must be a dict, got {type(entry)}")
+        name = _require_string(entry.get("name"), f"modules[{idx}].name")
+        if name in seen_names:
+            raise ValueError(f"Duplicate quant artifact module name: {name}")
+        seen_names.add(name)
+
+        backend_class = _require_string(entry.get("backend_class"), f"modules[{idx}].backend_class")
+        fmt = _require_string(entry.get("format"), f"modules[{idx}].format")
+        if fmt not in _SUPPORTED_FORMATS:
+            raise ValueError(f"Unsupported quant artifact format for {name}: {fmt!r}")
+        if backend_class not in _BACKEND_BITS:
+            raise ValueError(f"Unsupported quant artifact backend_class for {name}: {backend_class!r}")
+        if expected_plan is not None:
+            expected_backend = _backend_for_name(expected_plan, name)
+            expected_backend_class = _BACKEND_CLASSES.get(expected_backend)
+            if expected_backend_class != backend_class:
+                raise ValueError(
+                    f"Quant artifact {name} has backend_class={backend_class!r}, "
+                    f"but strategy {expected_strategy!r} expects {expected_backend_class!r}"
+                )
+
+        expected_bits = _BACKEND_BITS[backend_class]
+        if int(entry.get("num_bits", -1)) != expected_bits:
+            raise ValueError(
+                f"Quant artifact {name} has num_bits={entry.get('num_bits')!r}, "
+                f"but {backend_class} expects {expected_bits}"
+            )
+        group_size = int(entry.get("group_size", 0))
+        if expected_bits == 4 and group_size <= 0:
+            raise ValueError(f"Quant artifact {name} has invalid W4 group_size={entry.get('group_size')!r}")
+        if expected_bits == 8 and group_size not in {-1, 0} and group_size <= 0:
+            raise ValueError(f"Quant artifact {name} has invalid W8 group_size={entry.get('group_size')!r}")
+        if int(entry.get("size_k", 0)) <= 0 or int(entry.get("size_n", 0)) <= 0:
+            raise ValueError(
+                f"Quant artifact {name} has invalid shape size_k={entry.get('size_k')!r}, "
+                f"size_n={entry.get('size_n')!r}"
+            )
+
+        tensor_file = _require_string(entry.get("tensor_file"), f"modules[{idx}].tensor_file")
+        rel_tensor_path = Path(tensor_file)
+        if rel_tensor_path.is_absolute() or ".." in rel_tensor_path.parts:
+            raise ValueError(f"Quant artifact tensor_file must stay under artifact root: {tensor_file!r}")
+        tensor_path = root / tensor_file
+        if tensor_file in seen_files:
+            raise ValueError(f"Duplicate quant artifact tensor_file: {tensor_file}")
+        seen_files.add(tensor_file)
+        if not tensor_path.is_file():
+            raise FileNotFoundError(f"Missing quant artifact tensor file for {name}: {tensor_path}")
+
+        counts[backend_class] = counts.get(backend_class, 0) + 1
+
+    if check_tensors:
+        import torch
+
+        required_payload_keys = {"qweight", "scales"}
+        for entry in modules:
+            tensor_path = root / str(entry["tensor_file"])
+            payload = torch.load(tensor_path, map_location="cpu", weights_only=False)
+            if not isinstance(payload, dict):
+                raise TypeError(f"Quant tensor payload must be a dict: {tensor_path}")
+            missing = sorted(required_payload_keys - set(payload))
+            if missing:
+                raise KeyError(f"Quant tensor payload {tensor_path} missing keys: {missing}")
+
+    return {
+        "root": str(root),
+        "manifest": manifest,
+        "metadata": metadata,
+        "modules": len(modules),
+        "counts": counts,
+    }
+
+
+def validate_artifact_command(args: argparse.Namespace) -> None:
+    result = validate_quant_artifact(
+        args.quant_artifact_dir,
+        expected_strategy=args.strategy,
+        check_tensors=args.check_tensors,
+    )
+    print(json.dumps({k: v for k, v in result.items() if k != "manifest"}, indent=2, sort_keys=True))
 
 
 def export_command(args: argparse.Namespace) -> str:
@@ -281,6 +448,12 @@ def parse_args() -> argparse.Namespace:
     artifact.add_argument("--calib-limit", type=int, default=128)
     artifact.add_argument("--calib-alpha", type=float, default=0.5)
     artifact.set_defaults(func=write_artifact_manifest)
+
+    validate = sub.add_parser("validate-artifact")
+    validate.add_argument("--quant-artifact-dir", required=True)
+    validate.add_argument("--strategy", choices=sorted(STRATEGIES))
+    validate.add_argument("--check-tensors", action="store_true")
+    validate.set_defaults(func=validate_artifact_command)
 
     common_model = argparse.ArgumentParser(add_help=False)
     common_model.add_argument("--python", default="python")

@@ -49,6 +49,7 @@ from cosmos_framework.scripts.action_policy_server_utils import (
     disable_runtime_ema_for_frozen_config,
     maybe_init_distributed,
 )
+from cosmos_framework.scripts.robocasa365_quant_pipeline import validate_quant_artifact
 from cosmos_framework.utils import log
 
 _DEFAULT_OUTPUT_DIR = DEFAULT_FALLBACK_OUTPUT_DIR / "robocasa365_rldx"
@@ -627,10 +628,9 @@ class CosmosRoboCasa365Policy:
     def _load_quant_artifact_into_model(self, model: nn.Module, quant_import_dir: str) -> dict[str, int]:
         import_start = time.perf_counter()
         root = Path(quant_import_dir).expanduser()
-        manifest = json.loads((root / "manifest.json").read_text())
+        validation = validate_quant_artifact(root)
+        manifest = validation["manifest"]
         modules = manifest.get("modules", [])
-        if not isinstance(modules, list):
-            raise TypeError(f"quant artifact manifest modules must be a list, got {type(modules)}")
         backend_module = self._load_quant_backend_module()
         device = torch.device("cuda", torch.cuda.current_device())
         counts: dict[str, int] = {}

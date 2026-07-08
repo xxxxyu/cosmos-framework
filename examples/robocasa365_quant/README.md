@@ -143,6 +143,31 @@ python -m cosmos_framework.scripts.robocasa365_quant_pipeline \
   --limit 32
 ```
 
+For local RTX 4090 validation, source the environment template and use the
+wrapper:
+
+```bash
+source examples/robocasa365_quant/local_4090_env.example.sh
+STRATEGY=full_w4 CUDA_VISIBLE_DEVICES=2 \
+  examples/robocasa365_quant/run_direct_replay_4090.sh
+```
+
+The wrapper validates the packed artifact manifest, starts the direct-load
+server, waits for the ZMQ port, runs replay, writes `profile_events.jsonl`, and
+summarizes server profile events into `profile_summary.json`.
+
+## Validate Artifact
+
+```bash
+python -m cosmos_framework.scripts.robocasa365_quant_pipeline \
+  validate-artifact \
+  --quant-artifact-dir /path/to/quant_artifacts/attention_w8 \
+  --strategy attention_w8
+```
+
+Use `--check-tensors` when you want to open every tensor payload as well as
+checking manifest structure and file existence.
+
 ## Rollout Gate
 
 The validated long-horizon gate uses:
