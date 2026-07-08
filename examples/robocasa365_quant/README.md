@@ -3,6 +3,9 @@
 This overlay is the first productized surface for the Cosmos3 Nano
 RoboCasa365 CloseFridge quantization work.
 
+For release testing and real-robot handoff notes, read
+`examples/robocasa365_quant/RELEASE_TESTING.md`.
+
 It supports four fixed weight-only strategies:
 
 | Strategy | Plan | M13 success | Direct replay peak alloc |
@@ -269,14 +272,17 @@ disable_video=1
 Do not use `USE_TASK_HORIZON=1` for this gate; it can silently restore the
 CloseFridge horizon to 600.
 
-## Current Runtime Caveat
+## Current Runtime Notes
 
-Memory is already within the 24GB target for all four quantized strategies, but
-the current packed Marlin W4/W8 integration is not faster than BF16 in the
-direct replay benchmark. The likely causes are small per-request GEMM shapes,
-Python-level per-Linear replacement, unfused attention/MLP execution, separate
-reshape/contiguous/bias/input-scale operations, and lack of graph capture or
-larger batching.
+Memory is within the 24GB target for all four quantized strategies. On the
+validated RTX 4090 stack, direct replay generate latency is around 1.0-1.2s for
+the recommended `attention_w8` path and similar W8-heavy strategies.
+
+Further operator-level optimization is possible but not included in this stable
+release. Real-shape microbenchmarks show that most quantized-linear time is
+already dominated by large MLP shapes where the current Marlin backend is
+competitive; shape-aware backend selection has only modest expected upside for
+this release.
 
 For deployment, benchmark and optimize runtime on the target GPU, especially
 RTX 4090 / Ada. H100 speed is useful but not definitive for 4090.
