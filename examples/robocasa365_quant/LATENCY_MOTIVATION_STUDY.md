@@ -129,6 +129,58 @@ Notes:
    - `guidance=1.0`, `num_steps=2`
    - Compare replay32 parity and short rollout before any 50-episode run.
 
+## CFG / Step Quality Gate
+
+Date: 2026-07-09.
+
+Common configuration:
+
+- checkpoint: `iter_000008000`
+- config: `robocasa365_repro/config.yaml`
+- quant strategy/artifact: `attention_w8`
+- action chunk: `32`, served action steps: `8`
+- replay capture: `closefridge_action_parity_v1`, limit `32`
+- rollout protocol: `CloseFridge`, `target`, `N_EPISODES=5`, `N_ENVS=1`,
+  `MAX_EPISODE_STEPS=1200`, `USE_TASK_HORIZON=0`, video disabled
+
+Replay32 was run on a local RTX 4090. It is the open-loop parity and local
+latency gate.
+
+| Variant | Denoiser forwards/request | Generate p50/p95 | Request p50/p95 | Generate speedup | L1 mean/p95 | Linf mean/p95 |
+|---|---:|---:|---:|---:|---:|---:|
+| `guidance3_steps4` baseline | 8 | 1063/1190 ms | 1250/1419 ms | 1.00x | 0.0428/0.0847 | 0.306/0.773 |
+| `guidance1_steps4` | 4 | 614/666 ms | 771/985 ms | 1.73x | 0.0404/0.0830 | 0.289/0.599 |
+| `guidance3_steps2` | 4 | 633/694 ms | 793/951 ms | 1.68x | 0.0435/0.0744 | 0.284/0.527 |
+| `guidance1_steps2` | 2 | 382/444 ms | 532/695 ms | 2.78x | 0.0412/0.0743 | 0.271/0.520 |
+
+Replay32 run root:
+`/home/lixiangyu/cosmos_ws/local_4090_validation/logs/guidance_step_gate_20260709_003628`.
+
+Short rollout was run on `aigc28` H100. These timings are not directly
+comparable to local 4090 timings, but they confirm rollout-path behavior and
+relative denoising cost.
+
+| Variant | Success | Requests | Generate p50/p95 | Request p50/p95 | Peak alloc/reserved |
+|---|---:|---:|---:|---:|---:|
+| `guidance1_steps4` | 5/5 | 274 | 419/444 ms | 433/473 ms | 13.94/14.19 GB |
+| `guidance3_steps2` | 5/5 | 278 | 430/445 ms | 455/481 ms | 13.94/14.19 GB |
+| `guidance1_steps2` | 4/5 | 326 | 242/262 ms | 255/284 ms | 13.94/14.19 GB |
+
+Short rollout shared run root:
+`/mnt/100T/lixiangyu/cosmos3_robocasa365_opt/rollouts/guidance_step_short_*_20260709_003737`.
+
+Interpretation:
+
+- All three variants passed replay32 parity on the fixed capture set.
+- `guidance1_steps2` is the fastest setting, but its first short rollout was
+  `4/5`; do not promote it directly to a 50-episode gate without at least one
+  repeat.
+- `guidance1_steps4` and `guidance3_steps2` both passed the short rollout
+  smoke at `5/5`. They are the safer candidates for a full 50-episode repeat.
+- Because `guidance1_steps4` and `guidance3_steps2` both use four denoiser
+  forwards per request, their rollout latency is similar. On the local 4090
+  replay gate, `guidance1_steps4` was slightly faster.
+
 ## Student Policy / Distillation Survey
 
 This direction is a research project, but it is the most plausible route to
