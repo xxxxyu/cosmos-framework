@@ -168,6 +168,47 @@ python -m cosmos_framework.scripts.robocasa365_quant_pipeline \
 Use `--check-tensors` when you want to open every tensor payload as well as
 checking manifest structure and file existence.
 
+## Profile Replay
+
+Use the profiling wrapper when investigating backend latency:
+
+```bash
+source examples/robocasa365_quant/local_4090_env.example.sh
+STRATEGY=attention_w8 \
+QUANT_ARTIFACT_DIR=$LOCAL_4090_ROOT/quant_artifacts/attention_w8 \
+CUDA_VISIBLE_DEVICES=2 \
+PROFILE_TOOL=nsys \
+REPLAY_LIMIT=8 \
+examples/robocasa365_quant/profile_direct_replay_4090.sh
+```
+
+`PROFILE_TOOL` may be:
+
+| Tool | Purpose |
+|---|---|
+| `none` | server/replay timing only |
+| `nsys` | CUDA kernel/API attribution and condensed category summary |
+| `ncu-marlin` | targeted Nsight Compute profile for a small number of Marlin kernels |
+
+For targeted Marlin kernel profiling:
+
+```bash
+PROFILE_TOOL=ncu-marlin \
+NCU_LAUNCH_SKIP=32 \
+NCU_LAUNCH_COUNT=8 \
+NCU_SET=basic \
+examples/robocasa365_quant/profile_direct_replay_4090.sh
+```
+
+Start with `NCU_SET=basic`. Heavier sets should be used only on `REPLAY_LIMIT=1`
+or `2`, because Nsight Compute can replay selected kernels and substantially
+slow execution.
+
+If Nsight Compute reports `ERR_NVGPUCTRPERM`, GPU performance counters are
+restricted on that host. Use the `nsys` path for launch/API attribution, or ask
+an administrator to enable performance counter access before collecting
+kernel-internal metrics.
+
 ## Rollout Gate
 
 The validated long-horizon gate uses:
