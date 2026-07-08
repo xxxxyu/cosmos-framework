@@ -61,11 +61,16 @@ The following are speed-only prototypes in
 | Backend | Description |
 |---|---|
 | `torch_scaled_mm_fp8_w8a8` | Tensor-wise FP8 W8A8; dynamic activation quantization in forward; `torch._scaled_mm` |
+| `torch_scaled_mm_fp8_w8a8_kernel_only` | Tensor-wise FP8 W8A8; fixed benchmark activation is prequantized; times `torch._scaled_mm` only |
 | `torch_int8_mm_w8a8` | Tensor-wise INT8 W8A8; dynamic activation quantization in forward; `torch._int_mm` plus dequant |
 
 These use BF16 inputs and return BF16 outputs so they can be compared with the
 existing microbench contract. They are not calibrated and should not be used as
 robot policy backends.
+
+The `kernel_only` FP8 backend is even narrower: it stores a prequantized copy of
+the fixed benchmark input. It is only for separating FP8 matmul kernel speed
+from dynamic activation quantization overhead.
 
 ## Reproduce Real-Shape Benchmark
 
@@ -94,7 +99,7 @@ CUDA_VISIBLE_DEVICES=0 "$COSMOS_PYTHON" \
   -m cosmos_framework.scripts.quant_backend_microbench \
   --shape-file /tmp/cosmos3_shape_profile_attention_w8/linear_shapes.jsonl \
   --max-shapes 8 \
-  --backends bf16,vllm_gptq_marlin_w4a16,vllm_gptq_marlin_w8a16,vllm_allspark_w8a16,torch_scaled_mm_fp8_w8a8,torch_int8_mm_w8a8 \
+  --backends bf16,vllm_gptq_marlin_w4a16,vllm_gptq_marlin_w8a16,vllm_allspark_w8a16,torch_scaled_mm_fp8_w8a8,torch_scaled_mm_fp8_w8a8_kernel_only,torch_int8_mm_w8a8 \
   --chain none \
   --warmup 5 \
   --iters 20 \
@@ -142,17 +147,65 @@ Selective FP8 upper bound on this top-8 set:
 This is enough to justify a narrow follow-up, but not enough to replace the
 stable W4/W8A16 release path.
 
+## FP8 Kernel-Only Follow-Up
+
+Run:
+
+```text
+/tmp/cosmos3_operator_microbench_attention_w8_top8_fp8_kernel_only_20260708_215407.json
+```
+
+Weighted top-8 result:
+
+| Backend | Benchmarked shapes | Weighted candidate ms | Weighted ratio vs BF16 |
+|---|---:|---:|---:|
+| BF16 | 8 | 0.1698 | 0.973 |
+| vLLM Marlin W4A16 | 8 | 0.1440 | 0.849 |
+| vLLM Marlin W8A16 | 8 | 0.1492 | 0.880 |
+| FP8 W8A8 dynamic | 8 | 0.1664 | 0.981 |
+| FP8 W8A8 kernel-only | 8 | 0.0882 | 0.522 |
+
+Shape-level result:
+
+| Count | Example | Shape | BF16 ms | Marlin W4 ms | Marlin W8 ms | FP8 dyn ms | FP8 kernel ms | Dynamic quant overhead ms |
+|---:|---|---|---:|---:|---:|---:|---:|---:|
+| 576 | `mlp_moe_gen.gate_proj` | `518x4096->12288` | 0.4183 | 0.3520 | 0.3651 | 0.2362 | 0.1952 | 0.0410 |
+| 576 | `self_attn.k_proj_moe_gen` | `518x4096->1024` | 0.0422 | 0.0467 | 0.0480 | 0.1383 | 0.0328 | 0.1055 |
+| 576 | `self_attn.o_proj_moe_gen` | `518x4096->4096` | 0.1407 | 0.1228 | 0.1273 | 0.1327 | 0.0740 | 0.0587 |
+| 288 | `mlp.gate_proj` | `10x4096->12288` | 0.1192 | 0.0347 | 0.0415 | 0.1167 | 0.0310 | 0.0857 |
+| 288 | `mlp.gate_proj` | `82x4096->12288` | 0.1242 | 0.0846 | 0.0867 | 0.1211 | 0.0474 | 0.0737 |
+| 288 | `mlp_moe_gen.down_proj` | `518x12288->4096` | 0.3735 | 0.3454 | 0.3581 | 0.3448 | 0.2172 | 0.1276 |
+| 288 | `self_attn.k_proj` | `10x4096->1024` | 0.0302 | 0.0345 | 0.0340 | 0.1022 | 0.0331 | 0.0691 |
+| 288 | `self_attn.k_proj` | `82x4096->1024` | 0.0177 | 0.0413 | 0.0402 | 0.1308 | 0.0380 | 0.0928 |
+
+Interpretation:
+
+- Ada FP8 matmul itself is fast enough to matter: the kernel-only top-8
+  weighted average is `0.0882 ms`, about `39%` faster than Marlin W4 on the
+  same shape mix.
+- The current dynamic FP8 path is not deployable for speed. Its weighted
+  average is `0.1664 ms`, slower than Marlin W4 and W8 because activation
+  quantization is implemented as eager PyTorch pointwise work before
+  `_scaled_mm`.
+- A production A8 path must use fused or otherwise low-overhead activation
+  quantization. Without that, adding A8 into the policy server would likely
+  increase latency despite good FP8 Tensor Core throughput.
+- The highest-value follow-up is not more model-level routing yet. It is an
+  operator-level implementation study for fused/blockwise activation quant plus
+  FP8 GEMM on the large MLP shapes.
+
 ## Recommended Next Steps
 
-1. Add a kernel-only FP8 microbench variant that separates activation
-   quantization overhead from matmul speed.
-2. Test row-wise or block-wise FP8 scales if `torch._scaled_mm` supports a
+1. Test row-wise or block-wise FP8 scales if `torch._scaled_mm` supports a
    layout compatible with the Cosmos shapes.
-3. If FP8 large-shape speed remains strong, prototype a per-shape runtime
+2. Survey and benchmark mature fused A8 paths on RTX 4090, especially
+   CUTLASS/cuBLASLt/TensorRT-style FP8 GEMM integrations that avoid eager
+   activation quant overhead.
+3. If FP8 large-shape speed remains strong with fused activation quant,
+   prototype a per-shape runtime
    policy for only the high-payoff MLP shapes.
 4. Only after speed is clearly positive, add activation calibration and compare
    BF16 vs quantized actions on replay captures.
 5. W4A8 should be a separate investigation using a mature CUTLASS/TensorRT or
    PyTorch float4/int4 packed path; do not hand-roll it into the policy server
    without a standalone benchmark first.
-
