@@ -17,6 +17,8 @@ export SERVED_ACTION_STEPS="${SERVED_ACTION_STEPS:-8}"
 export SERVER_READY_TIMEOUT_SEC="${SERVER_READY_TIMEOUT_SEC:-900}"
 export SERVER_SHUTDOWN_TIMEOUT_SEC="${SERVER_SHUTDOWN_TIMEOUT_SEC:-60}"
 export PROFILE_TOOL="${PROFILE_TOOL:-none}" # none | nsys | ncu-marlin
+export NSYS_BIN="${NSYS_BIN:-nsys}"
+export NCU_BIN="${NCU_BIN:-ncu}"
 export RUN_DIR="${RUN_DIR:-/tmp/cosmos3_robocasa365_quant_profile_$(date +%Y%m%d_%H%M%S)}"
 export PYTHONPATH="$COSMOS_REPO:$COSMOS_REPO/packages/transformers-cosmos3/src:$COSMOS_REPO/packages/diffusers-cosmos3/src:$COSMOS_REPO/packages/vllm-cosmos3:${PYTHONPATH:-}"
 
@@ -53,7 +55,7 @@ case "$PROFILE_TOOL" in
     ;;
   nsys)
     profiled_cmd=(
-      nsys profile
+      "$NSYS_BIN" profile
       --force-overwrite=true
       --sample=none
       --cpuctxsw=none
@@ -64,7 +66,7 @@ case "$PROFILE_TOOL" in
     ;;
   ncu-marlin)
     profiled_cmd=(
-      ncu
+      "$NCU_BIN"
       --target-processes all
       --kernel-name-base demangled
       --kernel-name 'regex:.*marlin::Marlin.*'
@@ -151,7 +153,7 @@ if [[ -s "$COSMOS3_PROFILE_JSONL" ]]; then
 fi
 
 if [[ "$PROFILE_TOOL" == "nsys" && -s "$RUN_DIR/nsys_server.nsys-rep" ]]; then
-  nsys stats \
+  "$NSYS_BIN" stats \
     --force-export=true \
     --format csv \
     --report cuda_gpu_kern_sum,cuda_gpu_mem_time_sum,cuda_api_sum \

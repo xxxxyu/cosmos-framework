@@ -207,7 +207,12 @@ slow execution.
 If Nsight Compute reports `ERR_NVGPUCTRPERM`, GPU performance counters are
 restricted on that host. Use the `nsys` path for launch/API attribution, or ask
 an administrator to enable performance counter access before collecting
-kernel-internal metrics.
+kernel-internal metrics. When running the profiler under `sudo`, explicitly set
+`NCU_BIN` if root's `PATH` does not include CUDA tools, for example:
+
+```bash
+NCU_BIN=/usr/local/cuda-12.4/bin/ncu PROFILE_TOOL=ncu-marlin ...
+```
 
 ## Rollout Gate
 
