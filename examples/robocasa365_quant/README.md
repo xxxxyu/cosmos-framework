@@ -194,6 +194,7 @@ For targeted Marlin kernel profiling:
 
 ```bash
 PROFILE_TOOL=ncu-marlin \
+NCU_KERNEL_NAME='regex:.*marlin::Marlin.*' \
 NCU_LAUNCH_SKIP=32 \
 NCU_LAUNCH_COUNT=8 \
 NCU_SET=basic \
@@ -203,6 +204,10 @@ examples/robocasa365_quant/profile_direct_replay_4090.sh
 Start with `NCU_SET=basic`. Heavier sets should be used only on `REPLAY_LIMIT=1`
 or `2`, because Nsight Compute can replay selected kernels and substantially
 slow execution.
+
+Set `NCU_KERNEL_NAME` to a narrower Nsight Compute kernel-name filter when a
+single replay contains multiple Marlin variants and you need kernel-internal
+metrics for one shape at a time.
 
 If Nsight Compute reports `ERR_NVGPUCTRPERM`, GPU performance counters are
 restricted on that host. Use the `nsys` path for launch/API attribution, or ask

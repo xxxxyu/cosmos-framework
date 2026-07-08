@@ -19,6 +19,7 @@ export SERVER_SHUTDOWN_TIMEOUT_SEC="${SERVER_SHUTDOWN_TIMEOUT_SEC:-60}"
 export PROFILE_TOOL="${PROFILE_TOOL:-none}" # none | nsys | ncu-marlin
 export NSYS_BIN="${NSYS_BIN:-nsys}"
 export NCU_BIN="${NCU_BIN:-ncu}"
+export NCU_KERNEL_NAME="${NCU_KERNEL_NAME:-regex:.*marlin::Marlin.*}"
 export RUN_DIR="${RUN_DIR:-/tmp/cosmos3_robocasa365_quant_profile_$(date +%Y%m%d_%H%M%S)}"
 export PYTHONPATH="$COSMOS_REPO:$COSMOS_REPO/packages/transformers-cosmos3/src:$COSMOS_REPO/packages/diffusers-cosmos3/src:$COSMOS_REPO/packages/vllm-cosmos3:${PYTHONPATH:-}"
 
@@ -69,7 +70,7 @@ case "$PROFILE_TOOL" in
       "$NCU_BIN"
       --target-processes all
       --kernel-name-base demangled
-      --kernel-name 'regex:.*marlin::Marlin.*'
+      --kernel-name "$NCU_KERNEL_NAME"
       --launch-skip "${NCU_LAUNCH_SKIP:-32}"
       --launch-count "${NCU_LAUNCH_COUNT:-8}"
       --set "${NCU_SET:-basic}"
