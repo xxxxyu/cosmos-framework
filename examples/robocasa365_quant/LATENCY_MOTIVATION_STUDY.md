@@ -181,6 +181,52 @@ Interpretation:
   forwards per request, their rollout latency is similar. On the local 4090
   replay gate, `guidance1_steps4` was slightly faster.
 
+### Theoretical Interpretation
+
+For this server path, the dominant cost is the MoT denoiser. The first-order
+cost model is:
+
+```text
+denoiser_forwards_per_request =
+  num_steps * (2 if guidance > 1 else 1)
+```
+
+The baseline `guidance=3.0,num_steps=4` therefore uses eight denoiser forwards
+per request. The three gate variants reduce this to:
+
+| Variant | Forward count | Main approximation |
+|---|---:|---|
+| `guidance1_steps4` | 4 | removes classifier-free guidance branch |
+| `guidance3_steps2` | 4 | keeps CFG but coarsens the denoising trajectory |
+| `guidance1_steps2` | 2 | removes CFG and coarsens the trajectory |
+
+CFG changes the conditional denoising vector field. With guidance enabled, the
+effective prediction is an extrapolation from unconditional to conditional
+prediction; with `guidance=1.0`, it is just the conditional prediction and the
+unconditional branch can be skipped. This is an exact compute reduction for the
+implementation, but it is not an exact model-equivalent transformation because
+the sampler follows a different vector field.
+
+Reducing `num_steps` changes the numerical integration of the diffusion/flow
+trajectory. It saves compute linearly in the dominant denoiser term, but it
+increases discretization error. In closed-loop control, small per-request action
+changes can compound through state feedback, so replay32 action parity is a
+necessary but insufficient gate.
+
+The short rollout results are consistent with this model:
+
+- `guidance1_steps4` and `guidance3_steps2` both have four denoiser forwards and
+  similar rollout latency. They also both reached `5/5`, so either
+  approximation may be acceptable for this task.
+- `guidance1_steps2` has the best latency because it uses only two forwards,
+  but it combines both approximations and produced the only short-rollout
+  failure. Its higher rollout request count also suggests at least one episode
+  took longer or failed late, which is exactly the failure mode that replay32
+  cannot rule out.
+- If the full 50-episode gate confirms similar success for `guidance1_steps4`
+  and `guidance3_steps2`, prefer `guidance1_steps4` on 4090 because the replay
+  gate shows slightly lower local latency with the same forward count.
+
 ## Student Policy / Distillation Survey
 
 This direction is a research project, but it is the most plausible route to
