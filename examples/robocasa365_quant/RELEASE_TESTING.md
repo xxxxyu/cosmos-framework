@@ -5,6 +5,10 @@ This document is the handoff runbook for the
 engineer or coding agent can check out the repo, validate the quantized policy,
 and understand what is still required before real-robot use.
 
+The complete benchmark record, including H100 repeats, RTX 4090 replay and
+rollout matrices, sampling ablations, and deployment recommendations, is in
+`examples/robocasa365_quant/BENCHMARKS.md`.
+
 ## Release Scope
 
 Target model:
