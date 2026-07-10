@@ -1,9 +1,9 @@
-# RoboCasa365 Quantized 4090 Release Testing
+# RoboCasa365 Self-Contained Quantized 4090 Release Testing
 
-This document is the handoff runbook for the `robocasa365-quant-v0.1-4090`
-release line. It is written so another engineer or coding agent can check out
-the repo, validate the quantized policy, and understand what is still required
-before real-robot use.
+This document is the handoff runbook for the
+`robocasa365-quant-v0.2-self-contained` release. It is written so another
+engineer or coding agent can check out the repo, validate the quantized policy,
+and understand what is still required before real-robot use.
 
 ## Release Scope
 
@@ -21,13 +21,12 @@ Published tag:
 ```bash
 git clone git@github.com:xxxxyu/cosmos-framework.git
 cd cosmos-framework
-git checkout robocasa365-quant-v0.1-4090
+git checkout robocasa365-quant-v0.2-self-contained
 ```
 
-If you need this runbook inside the checkout, use
-`robocasa365-quant-v0.1.1-4090-docs` or the newest
-`feature/robocasa365-quant-pipeline` branch. Do not move the already-published
-`robocasa365-quant-v0.1-4090` tag.
+The v0.2 deployment contract is a schema-v2 bundle. Legacy schema-v1 artifacts
+and the v0.1 release remain available only for rollback and must not be used for
+new deployments. Do not move any published tag.
 
 ## Validated Strategies
 
@@ -45,6 +44,25 @@ leaving comfortable memory headroom.
 Use these numbers as sanity checks, not as exact pass/fail thresholds. Fresh
 machines, drivers, CUDA builds, and Python package overlays can shift latency.
 
+## Self-Contained Bundle Validation
+
+The two representative schema-v2 bundles below were copied to a fresh checkout
+on an eight-GPU RTX 4090 machine. Each was loaded directly without the source
+DCP, source runtime config, or source packed-only artifact. All 32 replay
+requests were byte-identical to the corresponding legacy direct-load path. The
+inference settings were `guidance=3.0`, UniPC `num_steps=4`, batch size 1, and
+8 served action steps.
+
+| Bundle | On-disk bytes | 4090 peak allocated/reserved | Generate p50/p95 | Legacy parity |
+|---|---:|---:|---:|---:|
+| `attention_w8_v2_fast` | 14,025,041,490 | 13.93/14.28GB | 792.7/803.7 ms | 32/32 byte-identical |
+| `full_w8_v2_fast` | 19,292,105,862 | 19.20/19.50GB | 786.3/790.8 ms | 32/32 byte-identical |
+
+The bundle includes packed W4/W8 tensors, 305 residual non-quantized model
+state keys in Hugging Face safetensors, portable runtime config, Qwen
+tokenizer, Wan VAE, and a size plus SHA256 digest for every file. Source DCP
+paths are provenance strings only and are never accessed at runtime.
+
 ## Required Inputs
 
 A tester needs these artifacts on the target machine:
@@ -60,8 +78,9 @@ A tester needs these artifacts on the target machine:
 
 The bundle is not stored in git. If it is unavailable, build it from the BF16
 DCP and training-set calibration captures as described in `README.md`. The DCP
-and standalone config are export-time inputs and must not be required on a
-deployment host.
+and standalone config are export-time inputs and must not be copied to or
+required by a deployment host. Schema-v2 load rejects external checkpoint and
+config arguments so an accidental hidden dependency fails immediately.
 
 ## Environment Smoke Test
 
