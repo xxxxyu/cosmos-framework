@@ -14,10 +14,10 @@ init_script()
 
 import argparse
 import atexit
-import math
 import importlib.util
 import io
 import json
+import math
 import os
 import re
 import sys
@@ -51,6 +51,10 @@ from cosmos_framework.scripts.action_policy_server_utils import (
     DEFAULT_FALLBACK_OUTPUT_DIR,
     disable_runtime_ema_for_frozen_config,
     maybe_init_distributed,
+)
+from cosmos_framework.scripts.robocasa365_quant_bundle import (
+    BUNDLE_SCHEMA_VERSION,
+    materialize_bundle_config,
 )
 from cosmos_framework.scripts.robocasa365_quant_pipeline import validate_quant_artifact
 from cosmos_framework.utils import log
@@ -204,6 +208,7 @@ class ServerConfig:
     quant_calib_alpha: float
     quant_export_dir: str
     quant_import_dir: str
+    allow_legacy_quant_artifact: bool
 
 
 class MsgSerializer:
@@ -752,6 +757,9 @@ class CosmosRoboCasa365Policy:
             return
         quant_import_dir = cfg.quant_import_dir
         policy_self = self
+        artifact_validation = validate_quant_artifact(quant_import_dir)
+        artifact_manifest = artifact_validation["manifest"]
+        self_contained = artifact_manifest.get("schema_version") == BUNDLE_SCHEMA_VERSION
 
         from cosmos_framework.inference import model as inference_model
 
@@ -764,6 +772,8 @@ class CosmosRoboCasa365Policy:
             parallelism_config: Any = None,
             compile_config: Any = None,
         ) -> Any:
+            if config is None and self_contained:
+                raise ValueError("A self-contained quant bundle must be loaded with its bundled runtime config")
             if config is None:
                 config = inference_model.Cosmos3OmniConfig.from_pretrained(checkpoint_path)
             if parallelism_config is None:
@@ -774,6 +784,27 @@ class CosmosRoboCasa365Policy:
             config.compile = inference_model.attrs.asdict(compile_config)
             model = cls(config)
             checkpoint_type = inference_model.CheckpointType.from_path(checkpoint_path)
+            if self_contained:
+                expected_root = Path(quant_import_dir).expanduser().resolve()
+                if checkpoint_path.expanduser().resolve() != expected_root:
+                    raise ValueError(
+                        "Self-contained quant bundle checkpoint path must be the artifact root: "
+                        f"expected {expected_root}, got {checkpoint_path}"
+                    )
+                if not getattr(policy_self, "_direct_quant_import_applied", False):
+                    policy_self._load_quant_artifact_into_model(model.model, quant_import_dir)
+                state_dict = inference_model.get_model_state_dict(model.model)
+                storage_reader = inference_model.HuggingFaceStorageReader(str(checkpoint_path))
+                load_start = time.perf_counter()
+                inference_model.dcp.load(state_dict=state_dict, storage_reader=storage_reader)
+                _profile_event(
+                    "direct_quant_bundle_load",
+                    state_dict_keys=len(state_dict),
+                    bundle_path=str(checkpoint_path),
+                    elapsed_ms=_sync_elapsed_ms(load_start),
+                )
+                return model
+
             if checkpoint_type != inference_model.CheckpointType.DCP:
                 return original(
                     cls,
@@ -1216,7 +1247,7 @@ class PolicyServer:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint-path", required=True)
+    parser.add_argument("--checkpoint-path", default="")
     parser.add_argument("--config-file", default="")
     parser.add_argument("--output-dir", default=str(_DEFAULT_OUTPUT_DIR))
     parser.add_argument("--host", default="*")
@@ -1257,14 +1288,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quant-calib-alpha", type=float, default=0.5)
     parser.add_argument("--quant-export-dir", default="")
     parser.add_argument("--quant-import-dir", default="")
+    parser.add_argument("--allow-legacy-quant-artifact", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    config_file = args.config_file or _infer_config_file(args.checkpoint_path)
+    checkpoint_path = args.checkpoint_path
+    config_file = args.config_file
+    if args.quant_import_dir:
+        validation = validate_quant_artifact(args.quant_import_dir)
+        if validation["self_contained"]:
+            bundle_root = Path(validation["root"])
+            if checkpoint_path and Path(checkpoint_path).expanduser().resolve() != bundle_root:
+                raise ValueError("Do not pass an external --checkpoint-path with a self-contained quant bundle")
+            if config_file:
+                raise ValueError("Do not pass an external --config-file with a self-contained quant bundle")
+            checkpoint_path = str(bundle_root)
+            config_file = str(materialize_bundle_config(bundle_root, args.output_dir))
+        elif not args.allow_legacy_quant_artifact:
+            raise ValueError(
+                "Legacy schema-v1 quant artifacts depend on an external DCP. Convert this artifact with "
+                "robocasa365_quant_pipeline build-self-contained-bundle, or explicitly pass "
+                "--allow-legacy-quant-artifact for rollback-only use."
+            )
+    if not checkpoint_path:
+        raise ValueError("--checkpoint-path is required unless --quant-import-dir is a self-contained bundle")
+    config_file = config_file or _infer_config_file(checkpoint_path)
     cfg = ServerConfig(
-        checkpoint_path=str(Path(args.checkpoint_path).expanduser()),
+        checkpoint_path=str(Path(checkpoint_path).expanduser()),
         config_file=str(Path(config_file).expanduser()),
         output_dir=str(Path(args.output_dir).expanduser()),
         host=args.host,
@@ -1295,6 +1347,7 @@ def main() -> None:
         quant_calib_alpha=args.quant_calib_alpha,
         quant_export_dir=args.quant_export_dir,
         quant_import_dir=args.quant_import_dir,
+        allow_legacy_quant_artifact=args.allow_legacy_quant_artifact,
     )
     policy = CosmosRoboCasa365Policy(cfg)
     PolicyServer(policy, cfg.host, cfg.port).run()

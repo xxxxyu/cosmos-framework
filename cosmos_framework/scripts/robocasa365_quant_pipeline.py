@@ -23,6 +23,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from cosmos_framework.scripts.robocasa365_quant_bundle import (
+    BUNDLE_SCHEMA_VERSION,
+    build_self_contained_bundle,
+    validate_self_contained_bundle,
+)
 
 _BACKEND_BITS = {
     "VllmGptqMarlinW4A16Linear": 4,
@@ -188,6 +193,7 @@ def validate_quant_artifact(
     *,
     expected_strategy: str | None = None,
     check_tensors: bool = False,
+    require_self_contained: bool = False,
 ) -> dict[str, Any]:
     """Validate a packed quant artifact manifest before serving or replay.
 
@@ -205,8 +211,19 @@ def validate_quant_artifact(
         raise TypeError(f"quant artifact manifest must be a dict, got {type(manifest)}")
 
     schema_version = manifest.get("schema_version")
-    if schema_version != 1:
-        raise ValueError(f"Unsupported quant artifact schema_version={schema_version!r}; expected 1")
+    if require_self_contained and schema_version != BUNDLE_SCHEMA_VERSION:
+        raise ValueError(
+            "Quantized deployment requires a self-contained schema-v2 bundle; "
+            f"artifact has schema_version={schema_version!r}"
+        )
+    bundle_validation: dict[str, Any] | None = None
+    if schema_version == BUNDLE_SCHEMA_VERSION:
+        bundle_validation = validate_self_contained_bundle(root, check_hashes=check_tensors)
+    elif schema_version != 1:
+        raise ValueError(
+            f"Unsupported quant artifact schema_version={schema_version!r}; "
+            f"expected 1 or {BUNDLE_SCHEMA_VERSION}"
+        )
 
     modules = manifest.get("modules")
     if not isinstance(modules, list) or not modules:
@@ -227,6 +244,15 @@ def validate_quant_artifact(
             raise ValueError(
                 f"quant artifact strategy mismatch: expected {expected_strategy!r}, "
                 f"metadata has {metadata.get('strategy')!r}"
+            )
+    elif schema_version == BUNDLE_SCHEMA_VERSION:
+        quantization = manifest.get("quantization", {})
+        if isinstance(quantization, dict):
+            metadata = quantization
+        if expected_strategy is not None and quantization.get("strategy") != expected_strategy:
+            raise ValueError(
+                f"quant artifact strategy mismatch: expected {expected_strategy!r}, "
+                f"bundle has {quantization.get('strategy')!r}"
             )
 
     seen_names: set[str] = set()
@@ -304,6 +330,9 @@ def validate_quant_artifact(
         "metadata": metadata,
         "modules": len(modules),
         "counts": counts,
+        "self_contained": schema_version == BUNDLE_SCHEMA_VERSION,
+        "state_keys": bundle_validation["state_keys"] if bundle_validation is not None else None,
+        "file_bytes": bundle_validation["file_bytes"] if bundle_validation is not None else None,
     }
 
 
@@ -312,11 +341,33 @@ def validate_artifact_command(args: argparse.Namespace) -> None:
         args.quant_artifact_dir,
         expected_strategy=args.strategy,
         check_tensors=args.check_tensors,
+        require_self_contained=args.require_self_contained,
+    )
+    print(json.dumps({k: v for k, v in result.items() if k != "manifest"}, indent=2, sort_keys=True))
+
+
+def build_bundle_command(args: argparse.Namespace) -> None:
+    validate_quant_artifact(args.quant_artifact_dir, expected_strategy=args.strategy)
+    strategy = _strategy(args.strategy)
+    result = build_self_contained_bundle(
+        strategy=args.strategy,
+        strategy_description=strategy.description,
+        strategy_plan=strategy.plan,
+        quant_artifact_dir=args.quant_artifact_dir,
+        checkpoint_path=args.checkpoint_path,
+        config_file=args.config_file,
+        tokenizer_dir=args.tokenizer_dir,
+        vae_path=args.vae_path,
+        output_dir=args.output_dir,
+        copy_mode=args.copy_mode,
+        max_shard_size_bytes=int(args.max_shard_size_gb * 1024**3),
     )
     print(json.dumps({k: v for k, v in result.items() if k != "manifest"}, indent=2, sort_keys=True))
 
 
 def export_command(args: argparse.Namespace) -> str:
+    if not args.checkpoint_path or not args.config_file:
+        raise ValueError("Quant export requires --checkpoint-path and --config-file")
     strategy = _strategy(args.strategy)
     plan_path = Path(args.plan_dir).expanduser() / f"{strategy.name}.json"
     parts = [
@@ -353,14 +404,11 @@ def export_command(args: argparse.Namespace) -> str:
 
 
 def serve_command(args: argparse.Namespace) -> str:
+    validation = validate_quant_artifact(args.quant_import_dir)
     parts = [
         args.python,
         "-m",
         "cosmos_framework.scripts.action_policy_server_robocasa365_quant",
-        "--checkpoint-path",
-        args.checkpoint_path,
-        "--config-file",
-        args.config_file,
         "--output-dir",
         args.output_dir,
         "--host",
@@ -374,6 +422,21 @@ def serve_command(args: argparse.Namespace) -> str:
         "--quant-import-dir",
         args.quant_import_dir,
     ]
+    if validation["self_contained"]:
+        if args.checkpoint_path or args.config_file:
+            raise ValueError("Self-contained quant serving must not use external checkpoint/config paths")
+    else:
+        if not args.checkpoint_path or not args.config_file:
+            raise ValueError("Legacy quant serving requires --checkpoint-path and --config-file")
+        parts.extend(
+            [
+                "--checkpoint-path",
+                args.checkpoint_path,
+                "--config-file",
+                args.config_file,
+                "--allow-legacy-quant-artifact",
+            ]
+        )
     return _quote_parts(parts)
 
 
@@ -453,12 +516,25 @@ def parse_args() -> argparse.Namespace:
     validate.add_argument("--quant-artifact-dir", required=True)
     validate.add_argument("--strategy", choices=sorted(STRATEGIES))
     validate.add_argument("--check-tensors", action="store_true")
+    validate.add_argument("--require-self-contained", action="store_true")
     validate.set_defaults(func=validate_artifact_command)
+
+    bundle = sub.add_parser("build-self-contained-bundle")
+    bundle.add_argument("--strategy", required=True, choices=sorted(STRATEGIES))
+    bundle.add_argument("--quant-artifact-dir", required=True)
+    bundle.add_argument("--checkpoint-path", required=True)
+    bundle.add_argument("--config-file", required=True)
+    bundle.add_argument("--tokenizer-dir", required=True)
+    bundle.add_argument("--vae-path", required=True)
+    bundle.add_argument("--output-dir", required=True)
+    bundle.add_argument("--copy-mode", choices=["copy", "hardlink"], default="copy")
+    bundle.add_argument("--max-shard-size-gb", type=float, default=2.0)
+    bundle.set_defaults(func=build_bundle_command)
 
     common_model = argparse.ArgumentParser(add_help=False)
     common_model.add_argument("--python", default="python")
-    common_model.add_argument("--checkpoint-path", required=True)
-    common_model.add_argument("--config-file", required=True)
+    common_model.add_argument("--checkpoint-path", default="")
+    common_model.add_argument("--config-file", default="")
     common_model.add_argument("--output-dir", required=True)
     common_model.add_argument("--host", default="127.0.0.1")
     common_model.add_argument("--port", type=int, default=5577)

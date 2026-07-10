@@ -3,11 +3,19 @@
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from cosmos_framework.scripts.robocasa365_quant_bundle import (
+    BUNDLE_ROOT_TOKEN,
+    build_self_contained_bundle,
+    materialize_bundle_config,
+    validate_self_contained_bundle,
+)
 from cosmos_framework.scripts.robocasa365_quant_pipeline import (
     STRATEGIES,
+    serve_command,
     validate_quant_artifact,
     write_strategy_configs,
 )
@@ -56,6 +64,13 @@ def test_validate_quant_artifact_accepts_minimal_manifest(tmp_path: Path) -> Non
     assert result["counts"] == {"VllmGptqMarlinW4A16Linear": 1}
 
 
+def test_validate_quant_artifact_can_require_self_contained(tmp_path: Path) -> None:
+    _write_minimal_artifact(tmp_path)
+
+    with pytest.raises(ValueError, match="self-contained schema-v2"):
+        validate_quant_artifact(tmp_path, require_self_contained=True)
+
+
 def test_validate_quant_artifact_rejects_wrong_bits(tmp_path: Path) -> None:
     _write_minimal_artifact(tmp_path)
     manifest_path = tmp_path / "manifest.json"
@@ -83,3 +98,92 @@ def test_validate_quant_artifact_rejects_escaping_tensor_file(tmp_path: Path) ->
 
     with pytest.raises(ValueError, match="artifact root"):
         validate_quant_artifact(tmp_path)
+
+
+def test_self_contained_bundle_survives_source_removal(tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+    dcp = pytest.importorskip("torch.distributed.checkpoint")
+    safetensors = pytest.importorskip("safetensors.torch")
+
+    source = tmp_path / "source"
+    checkpoint = source / "checkpoint"
+    checkpoint.mkdir(parents=True)
+    source_state = {
+        "net.language_model.model.layers.0.self_attn.q_proj.weight": torch.arange(
+            16, dtype=torch.bfloat16
+        ).reshape(4, 4),
+        "net.norm.weight": torch.arange(4, dtype=torch.bfloat16),
+        "net_ema.language_model.model.layers.0.self_attn.q_proj.weight": torch.full(
+            (4, 4), 9, dtype=torch.bfloat16
+        ),
+    }
+    dcp.save(source_state, checkpoint_id=checkpoint)
+
+    quant = source / "quant"
+    _write_minimal_artifact(quant)
+    (quant / "cosmos3_quant_metadata.json").write_text(
+        json.dumps({"strategy": "full_w4", "weight_only": True, "activation_quant": False})
+    )
+
+    tokenizer = source / "Qwen3-VL-8B-Instruct"
+    tokenizer.mkdir()
+    (tokenizer / "tokenizer.json").write_text("{}")
+    vae = source / "Wan2.2_VAE.pth"
+    vae.write_bytes(b"vae")
+    config = source / "config.yaml"
+    config.write_text(
+        "checkpoint:\n"
+        f"  load_path: {checkpoint}\n"
+        "runtime:\n"
+        f"  tokenizer: {tokenizer}\n"
+        f"  vae: {vae}\n"
+    )
+
+    bundle = tmp_path / "bundle"
+    result = build_self_contained_bundle(
+        strategy="full_w4",
+        strategy_plan=STRATEGIES["full_w4"].plan,
+        quant_artifact_dir=quant,
+        checkpoint_path=checkpoint,
+        config_file=config,
+        tokenizer_dir=tokenizer,
+        vae_path=vae,
+        output_dir=bundle,
+        max_shard_size_bytes=1024,
+    )
+    assert result["state_keys"] == 1
+    assert validate_quant_artifact(bundle, expected_strategy="full_w4")["self_contained"] is True
+    validate_self_contained_bundle(bundle, check_hashes=True)
+
+    moved_source = tmp_path / "source-removed"
+    source.rename(moved_source)
+    runtime_config = materialize_bundle_config(bundle, tmp_path / "runtime")
+    config_text = runtime_config.read_text()
+    assert BUNDLE_ROOT_TOKEN not in config_text
+    assert str(bundle) in config_text
+    assert str(moved_source) not in config_text
+
+    index = json.loads((bundle / "model.safetensors.index.json").read_text())
+    shard = bundle / index["weight_map"]["net.norm.weight"]
+    residual = safetensors.load_file(shard)
+    torch.testing.assert_close(residual["net.norm.weight"], source_state["net.norm.weight"])
+
+    restored = {"net.norm.weight": torch.empty_like(source_state["net.norm.weight"])}
+    reader = torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader(str(bundle))
+    dcp.load(state_dict=restored, storage_reader=reader)
+    torch.testing.assert_close(restored["net.norm.weight"], source_state["net.norm.weight"])
+
+    serve_args = SimpleNamespace(
+        python="python",
+        checkpoint_path="",
+        config_file="",
+        output_dir="/tmp/server",
+        host="127.0.0.1",
+        port=5577,
+        served_action_steps=8,
+        quant_import_dir=str(bundle),
+    )
+    command = serve_command(serve_args)
+    assert "--quant-import-dir" in command
+    assert "--checkpoint-path" not in command
+    assert "--config-file" not in command

@@ -11,9 +11,7 @@ export LOCAL_4090_ROOT="${LOCAL_4090_ROOT:-$HOME/cosmos_ws/local_4090_validation
 export COSMOS_REPO="${COSMOS_REPO:-$HOME/cosmos_ws/cosmos-framework-product}"
 export COSMOS_PYTHON="${COSMOS_PYTHON:-$LOCAL_4090_ROOT/envs/python313_pkg/bin/python}"
 
-export CHECKPOINT_PATH="${CHECKPOINT_PATH:-$LOCAL_4090_ROOT/checkpoints/iter_000008000}"
-export CONFIG_FILE="${CONFIG_FILE:-$LOCAL_4090_ROOT/configs/config.local.yaml}"
-export QUANT_ARTIFACT_DIR="${QUANT_ARTIFACT_DIR:-$LOCAL_4090_ROOT/quant_artifacts/full_w4}"
+export QUANT_BUNDLE_DIR="${QUANT_BUNDLE_DIR:-$LOCAL_4090_ROOT/self_contained/attention_w8_v2}"
 export REPLAY_CAPTURE_DIR="${REPLAY_CAPTURE_DIR:-$LOCAL_4090_ROOT/data/closefridge_action_parity_v1}"
 export RUN_DIR="${RUN_DIR:-$LOCAL_4090_ROOT/logs/direct_replay_$(date +%Y%m%d_%H%M%S)}"
 

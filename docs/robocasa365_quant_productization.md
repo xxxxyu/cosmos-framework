@@ -44,8 +44,9 @@ local replay latency and memory validation are the right next target.
 
 Caveats:
 
-- Exporting new quant artifacts from BF16 may still need H100 or a CPU/streaming
-  export path if the exporter materializes the full BF16 model on GPU.
+- Packed quant export may still need a GPU, but deployment packaging is now a
+  CPU-streaming operation. The schema-v2 bundle extracts only residual `net.*`
+  state from DCP and does not materialize the BF16 model on GPU.
 - A fresh 4090 deployment must validate that the selected `torch`/`vllm` build
   exposes compatible Marlin kernels for Ada / SM89.
 - Rollout can move local only if the RoboCasa/RLDX simulator environment is
@@ -60,6 +61,8 @@ contains:
 - a quant-capable RoboCasa365 policy server;
 - fixed strategy names and plan generation;
 - command generation for export, serve, replay, and rollout;
+- self-contained schema-v2 bundles with residual safetensors, portable config,
+  tokenizer, VAE, per-file sizes, and SHA256 checks;
 - documentation of the validated protocol and current runtime caveats.
 
 Next implementation work should focus on:
@@ -68,5 +71,5 @@ Next implementation work should focus on:
 - batching per-env inference inside the policy server;
 - evaluating CUDA graph capture for fixed replay shapes;
 - comparing Marlin vs alternative W8/W4 kernels on 4090;
-- adding a CPU/streaming export path if local 4090 quantization from BF16 is
-  required.
+- extending streaming packed-weight export if local 4090 quantization directly
+  from BF16 is required.

@@ -84,7 +84,7 @@ python -m cosmos_framework.scripts.robocasa365_quant_pipeline \
   --output-dir examples/robocasa365_quant/configs
 ```
 
-## Export A Quant Artifact
+## Export A Self-Contained Quant Bundle
 
 Use training-set calibration captures. The validated experiments used
 `calib_limit=128` and `calib_alpha=0.5`.
@@ -103,8 +103,8 @@ python -m cosmos_framework.scripts.robocasa365_quant_pipeline \
 
 The command printed by this helper starts
 `cosmos_framework.scripts.action_policy_server_robocasa365_quant` with
-`--quant-export-dir`. The server exits after writing the quant artifact
-manifest.
+`--quant-export-dir`. This first stage writes packed quant tensors. It is not a
+deployable artifact by itself.
 
 After export, attach metadata:
 
@@ -118,20 +118,40 @@ python -m cosmos_framework.scripts.robocasa365_quant_pipeline \
   --calib-capture-dir /path/to/train_calib_capture
 ```
 
+Convert the packed tensors and the source DCP into one schema-v2 deployment
+bundle. This CPU-streaming step copies only the non-quantized `net.*` state,
+the runtime config, Qwen tokenizer, and Wan VAE. It does not materialize the
+BF16 model on GPU.
+
+```bash
+python -m cosmos_framework.scripts.robocasa365_quant_pipeline \
+  build-self-contained-bundle \
+  --strategy attention_w8 \
+  --quant-artifact-dir /path/to/quant_artifacts/attention_w8 \
+  --checkpoint-path /path/to/checkpoints/iter_000008000/model \
+  --config-file /path/to/config.yaml \
+  --tokenizer-dir /path/to/Qwen3-VL-8B-Instruct \
+  --vae-path /path/to/Wan2.2_VAE.pth \
+  --output-dir /path/to/quant_bundles/attention_w8
+```
+
+Only the resulting bundle should be copied to deployment machines. The source
+DCP, config, tokenizer, VAE, and packed-only artifact are export-time inputs.
+
 ## Serve A Quant Artifact
 
 ```bash
 python -m cosmos_framework.scripts.robocasa365_quant_pipeline \
   print-serve-command \
-  --checkpoint-path /path/to/checkpoints/iter_000008000 \
-  --config-file /path/to/config.yaml \
-  --quant-import-dir /path/to/quant_artifacts/attention_w8 \
+  --quant-import-dir /path/to/quant_bundles/attention_w8 \
   --output-dir /tmp/cosmos3_attention_w8_server \
   --port 5577
 ```
 
-The direct-load path inserts packed W4/W8 modules before the DCP BF16 weight
-load, so it avoids materializing the full BF16 language model on GPU.
+The server resolves its checkpoint, runtime config, tokenizer, and VAE from the
+bundle. External checkpoint/config arguments are rejected for schema-v2
+artifacts. Schema-v1 artifacts require the explicit rollback-only
+`--allow-legacy-quant-artifact` server flag.
 
 ## Replay Benchmark
 
@@ -151,7 +171,7 @@ wrapper:
 
 ```bash
 source examples/robocasa365_quant/local_4090_env.example.sh
-STRATEGY=full_w4 CUDA_VISIBLE_DEVICES=2 \
+STRATEGY=attention_w8 CUDA_VISIBLE_DEVICES=2 \
   examples/robocasa365_quant/run_direct_replay_4090.sh
 ```
 
@@ -164,8 +184,9 @@ summarizes server profile events into `profile_summary.json`.
 ```bash
 python -m cosmos_framework.scripts.robocasa365_quant_pipeline \
   validate-artifact \
-  --quant-artifact-dir /path/to/quant_artifacts/attention_w8 \
-  --strategy attention_w8
+  --quant-artifact-dir /path/to/quant_bundles/attention_w8 \
+  --strategy attention_w8 \
+  --require-self-contained
 ```
 
 Use `--check-tensors` when you want to open every tensor payload as well as
@@ -178,7 +199,7 @@ Use the profiling wrapper when investigating backend latency:
 ```bash
 source examples/robocasa365_quant/local_4090_env.example.sh
 STRATEGY=attention_w8 \
-QUANT_ARTIFACT_DIR=$LOCAL_4090_ROOT/quant_artifacts/attention_w8 \
+QUANT_BUNDLE_DIR=$LOCAL_4090_ROOT/quant_bundles/attention_w8 \
 CUDA_VISIBLE_DEVICES=2 \
 PROFILE_TOOL=nsys \
 REPLAY_LIMIT=8 \

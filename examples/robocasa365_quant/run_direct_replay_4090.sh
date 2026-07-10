@@ -18,16 +18,15 @@ export SERVER_READY_TIMEOUT_SEC="${SERVER_READY_TIMEOUT_SEC:-900}"
 export RUN_DIR="${RUN_DIR:-/tmp/cosmos3_robocasa365_quant_replay_$(date +%Y%m%d_%H%M%S)}"
 export PYTHONPATH="$COSMOS_REPO:$COSMOS_REPO/packages/transformers-cosmos3/src:$COSMOS_REPO/packages/diffusers-cosmos3/src:$COSMOS_REPO/packages/vllm-cosmos3:${PYTHONPATH:-}"
 
-: "${CHECKPOINT_PATH:?set CHECKPOINT_PATH to the iter_000008000 checkpoint directory}"
-: "${CONFIG_FILE:?set CONFIG_FILE to the RoboCasa365 config yaml}"
-: "${QUANT_ARTIFACT_DIR:?set QUANT_ARTIFACT_DIR to the packed quant artifact}"
+: "${QUANT_BUNDLE_DIR:?set QUANT_BUNDLE_DIR to a self-contained schema-v2 quant bundle}"
 : "${REPLAY_CAPTURE_DIR:?set REPLAY_CAPTURE_DIR to the captured replay request directory}"
 
 mkdir -p "$RUN_DIR/server" "$RUN_DIR/replay"
 export COSMOS3_PROFILE_JSONL="$RUN_DIR/profile_events.jsonl"
 
 validate_args=(
-  --quant-artifact-dir "$QUANT_ARTIFACT_DIR"
+  --quant-artifact-dir "$QUANT_BUNDLE_DIR"
+  --require-self-contained
 )
 if [[ -n "${STRATEGY:-}" ]]; then
   validate_args+=(--strategy "$STRATEGY")
@@ -38,15 +37,13 @@ fi
   "${validate_args[@]}"
 
 "$COSMOS_PYTHON" -m cosmos_framework.scripts.action_policy_server_robocasa365_quant \
-  --checkpoint-path "$CHECKPOINT_PATH" \
-  --config-file "$CONFIG_FILE" \
   --output-dir "$RUN_DIR/server" \
   --host "$HOST" \
   --port "$PORT" \
   --served-action-steps "$SERVED_ACTION_STEPS" \
   --no-guardrails \
   --no-torch-compile \
-  --quant-import-dir "$QUANT_ARTIFACT_DIR" \
+  --quant-import-dir "$QUANT_BUNDLE_DIR" \
   >"$RUN_DIR/server.log" 2>&1 &
 server_pid=$!
 

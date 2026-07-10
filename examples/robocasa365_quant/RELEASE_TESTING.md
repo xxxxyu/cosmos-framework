@@ -52,16 +52,16 @@ A tester needs these artifacts on the target machine:
 - Cosmos checkout on this branch/tag.
 - A Python environment that imports `torch`, `vllm._C`, and local
   `cosmos_framework`.
-- BF16 DCP checkpoint directory, e.g. `iter_000008000`.
-- The matching Cosmos config YAML.
-- A packed quant artifact directory with `manifest.json` and `tensors/*.pt`.
+- One self-contained schema-v2 quant bundle. It includes packed quant tensors,
+  residual non-quantized model state, runtime config, tokenizer, and Wan VAE.
 - Optional direct replay capture directory, e.g.
   `closefridge_action_parity_v1`, for fast validation without simulator.
 - RoboCasa/RLDX simulator only for closed-loop rollout.
 
-The quant artifact is not stored in git. If it is not available, export it from
-the BF16 checkpoint with training-set calibration captures as described in
-`README.md`.
+The bundle is not stored in git. If it is unavailable, build it from the BF16
+DCP and training-set calibration captures as described in `README.md`. The DCP
+and standalone config are export-time inputs and must not be required on a
+deployment host.
 
 ## Environment Smoke Test
 
@@ -91,8 +91,9 @@ Validate manifest and tensor files before serving:
 ```bash
 python -m cosmos_framework.scripts.robocasa365_quant_pipeline \
   validate-artifact \
-  --quant-artifact-dir /path/to/quant_artifacts/attention_w8 \
+  --quant-artifact-dir /path/to/quant_bundles/attention_w8 \
   --strategy attention_w8 \
+  --require-self-contained \
   --check-tensors
 ```
 
@@ -111,9 +112,7 @@ postprocessing, latency, memory, and open-loop action parity.
 source examples/robocasa365_quant/local_4090_env.example.sh
 
 STRATEGY=attention_w8 \
-QUANT_ARTIFACT_DIR=/path/to/quant_artifacts/attention_w8 \
-CHECKPOINT_PATH=/path/to/iter_000008000 \
-CONFIG_FILE=/path/to/config.yaml \
+QUANT_BUNDLE_DIR=/path/to/quant_bundles/attention_w8 \
 REPLAY_CAPTURE_DIR=/path/to/closefridge_action_parity_v1 \
 CUDA_VISIBLE_DEVICES=0 \
 REPLAY_LIMIT=32 \
@@ -135,6 +134,8 @@ Sanity checks:
 - Replay action deviations are in the same range as prior validation for the
   same capture set.
 - No server error appears in `server.log`.
+- The server command and runtime config do not reference the source DCP or
+  machine-specific config paths.
 
 ## Closed-Loop Rollout Test
 
