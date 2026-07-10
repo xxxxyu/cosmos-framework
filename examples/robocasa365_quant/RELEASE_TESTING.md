@@ -72,15 +72,20 @@ python - <<'PY'
 import torch
 import vllm._C
 import cosmos_framework
+import diffusers_cosmos3
+import transformers_cosmos3
+import vllm_cosmos3
 print("torch", torch.__version__)
 print("cuda", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none")
-print("vllm._C ok")
+print("Cosmos package overlays and vllm._C ok")
 PY
 ```
 
 Expected:
 
 - `vllm._C` imports successfully.
+- All three Cosmos package overlays import from the checked-out repository or
+  its environment, not from a stale checkout path.
 - CUDA sees the target GPU.
 - No `LD_LIBRARY_PATH` conflict with unrelated CUDA/cuDNN installs.
 

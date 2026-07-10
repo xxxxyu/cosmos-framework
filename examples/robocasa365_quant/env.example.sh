@@ -16,7 +16,7 @@ export COSMOS_PYTHON="${COSMOS_PYTHON:-$COSMOS_REPO/.venv/bin/python}"
 
 # Optional external package overlays used by the current Cosmos3 action-policy
 # experiments. Keep empty for a self-contained fresh install.
-export PYTHONPATH="$COSMOS_REPO:$COSMOS_REPO/packages/transformers-cosmos3/src:$COSMOS_REPO/packages/diffusers-cosmos3/src:$COSMOS_REPO/packages/vllm-cosmos3:${PYTHONPATH:-}"
+export PYTHONPATH="$COSMOS_REPO:$COSMOS_REPO/packages/transformers-cosmos3:$COSMOS_REPO/packages/diffusers-cosmos3:$COSMOS_REPO/packages/vllm-cosmos3:${PYTHONPATH:-}"
 
 # RoboCasa/RLDX rollout environment. This is only needed for closed-loop rollout;
 # direct replay benchmark does not need the simulator.

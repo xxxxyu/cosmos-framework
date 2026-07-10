@@ -28,5 +28,5 @@ export CUDNN_HOME="${CUDNN_HOME:-$DINGXIN_SITE/nvidia/cudnn}"
 export NVRTC_HOME="${NVRTC_HOME:-$DINGXIN_SITE/nvidia/cuda_nvrtc}"
 export CURAND_HOME="${CURAND_HOME:-$DINGXIN_SITE/nvidia/curand}"
 
-export PYTHONPATH="$BACKEND_PROBE_SITE:$COSMOS_REPO:$COSMOS_REPO/packages/transformers-cosmos3/src:$COSMOS_REPO/packages/diffusers-cosmos3/src:$COSMOS_REPO/packages/vllm-cosmos3:$DINGXIN_SITE:${PYTHONPATH:-}"
+export PYTHONPATH="$BACKEND_PROBE_SITE:$COSMOS_REPO:$COSMOS_REPO/packages/transformers-cosmos3:$COSMOS_REPO/packages/diffusers-cosmos3:$COSMOS_REPO/packages/vllm-cosmos3:$DINGXIN_SITE:${PYTHONPATH:-}"
 export LD_LIBRARY_PATH="$LOCAL_4090_ROOT/envs/python313_pkg/lib:$CUDNN_HOME/lib:$NVRTC_HOME/lib:$CURAND_HOME/lib:$DINGXIN_SITE/nvidia/cublas/lib:$DINGXIN_SITE/nvidia/cuda_runtime/lib:$DINGXIN_SITE/nvidia/nccl/lib:$DINGXIN_SITE/nvidia/nvjitlink/lib:${LD_LIBRARY_PATH:-}"

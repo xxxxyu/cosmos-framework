@@ -16,7 +16,7 @@ export REPLAY_LIMIT="${REPLAY_LIMIT:-32}"
 export SERVED_ACTION_STEPS="${SERVED_ACTION_STEPS:-8}"
 export SERVER_READY_TIMEOUT_SEC="${SERVER_READY_TIMEOUT_SEC:-900}"
 export RUN_DIR="${RUN_DIR:-/tmp/cosmos3_robocasa365_quant_replay_$(date +%Y%m%d_%H%M%S)}"
-export PYTHONPATH="$COSMOS_REPO:$COSMOS_REPO/packages/transformers-cosmos3/src:$COSMOS_REPO/packages/diffusers-cosmos3/src:$COSMOS_REPO/packages/vllm-cosmos3:${PYTHONPATH:-}"
+export PYTHONPATH="$COSMOS_REPO:$COSMOS_REPO/packages/transformers-cosmos3:$COSMOS_REPO/packages/diffusers-cosmos3:$COSMOS_REPO/packages/vllm-cosmos3:${PYTHONPATH:-}"
 
 : "${QUANT_BUNDLE_DIR:?set QUANT_BUNDLE_DIR to a self-contained schema-v2 quant bundle}"
 : "${REPLAY_CAPTURE_DIR:?set REPLAY_CAPTURE_DIR to the captured replay request directory}"
