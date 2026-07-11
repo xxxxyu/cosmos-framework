@@ -15,19 +15,29 @@ The fixed precision strategies are:
 
 | Strategy | W4 modules | W8 modules | Deployment status |
 |---|---:|---:|---|
-| `full_w8` | 0 | 504 | Quality-first reference |
+| `full_w8` | 0 | 504 | General RoboLab default |
 | `full_w4` | 504 | 0 | Experimental memory floor; failed current rollout gate |
-| `attention_w8` | 216 | 288 | Memory-focused retained option |
-| `gen_branch_w8` | 252 | 252 | Balanced default |
+| `attention_w8` | 216 | 288 | Low-memory Banana option at guidance 3 / 4 steps |
+| `gen_branch_w8` | 252 | 252 | Banana-specific option; requires per-task validation |
 
 These are weight-only W4A16/W8A16 bundles. Activations remain BF16. W4 export
 requires DROID training calibration statistics unless the explicitly unsafe
 `--allow-uncalibrated-w4` flag is used.
 
-The current `BananaInBowlTask` result is 5/5 for `full_w8`, `attention_w8`, and
-`gen_branch_w8`, but 2/5 for `full_w4`. Five episodes do not prove equivalence
-among the retained options. Use the complete memory, replay, latency, and
-rollout table in [BENCHMARKS.md](BENCHMARKS.md) when choosing a bundle.
+The paired 50-episode `BananaInBowlTask` result at guidance 3 / 4 steps is
+43/50 for `full_w8`, 26/50 for `full_w4`, 42/50 for `attention_w8`, and 45/50
+for `gen_branch_w8`. The general deployment default is `full_w8` with guidance
+3 / 2 steps: it reached 45/50 on Banana and 25/30 across three additional task
+sets. Use [BENCHMARKS.md](BENCHMARKS.md) before choosing a bundle or sampler.
+
+## Observation Resolution
+
+RoboLab renders the wrist, left shoulder, and right shoulder cameras at
+1280x720 each. The Cosmos3 client resizes each view to 640x360, keeps the wrist
+view on top, and places two 320x180 exterior views side by side underneath.
+The OpenPI request therefore contains one 640x540 RGB image. The serving
+transform maps it to the resolution-480 4:3 model bucket, 736x544. The
+`resolution=480` setting is a bucket name, not a 480x480 tensor.
 
 ## Validate a Bundle
 
@@ -66,8 +76,8 @@ python -m cosmos_framework.scripts.export_robolab_train_calibration_requests \
 ```
 
 The exporter fails if fewer than 128 episodes have all three local RGB views.
-It emits one client-composed `540x640` request per episode plus a manifest and
-per-request dataset/episode/frame/video/SHA256 provenance.
+It emits one client-composed 640x540 W x H request per episode plus a manifest
+and per-request dataset/episode/frame/video/SHA256 provenance.
 
 Start a `full_w8` server with calibration hooks, then replay all requests:
 
@@ -119,13 +129,13 @@ after the manifest is complete.
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m \
   cosmos_framework.scripts.action_policy_server_robolab \
-  --quant-import-dir /path/to/attention_w8_bundle \
+  --quant-import-dir /path/to/full_w8_bundle \
   --host 0.0.0.0 \
   --port 8000 \
   --output-dir /path/to/server_run \
   --profile-jsonl /path/to/server_run/profile.jsonl \
   --guidance 3.0 \
-  --num-steps 4
+  --num-steps 2
 ```
 
 Production defaults keep guardrails and `torch.compile` disabled, use a
@@ -167,7 +177,9 @@ For every new bundle, task, checkpoint, or sampler setting:
 3. Run a one-episode end-to-end smoke.
 4. Run repeated closed-loop rollouts under one fixed protocol.
 
-Quantization and sampler changes are independently configurable but not assumed
-quality-orthogonal; validate their combination. Roll back by switching
-`--quant-import-dir` to the previous immutable bundle and restoring guidance
-`3.0`, UniPC steps `4`. Bundles are never modified in place.
+Quantization and sampler changes are independently configurable but are not
+quality-orthogonal. The Banana winner `gen_branch_w8` g3/s2 fell from 50/50 on
+Banana to 17/30 across three other tasks, while `full_w8` g3/s2 reached 25/30.
+Validate every combination. Roll back by switching `--quant-import-dir` to the
+immutable `full_w8` bundle and restoring guidance `3.0`, UniPC steps `4`.
+Bundles are never modified in place.

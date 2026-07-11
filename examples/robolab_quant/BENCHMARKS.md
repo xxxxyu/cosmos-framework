@@ -12,7 +12,8 @@ Unless a table states otherwise:
 - Model: public Cosmos3 Nano Policy DROID Diffusers checkpoint.
 - Quantization: packed vLLM Marlin weight-only W4A16/W8A16.
 - Batch size: one policy request; output action chunk: 32 x 8.
-- Resolution/views: 540 x 640 concat3 (wrist above left/right exterior).
+- Client request: 640x540 W x H (array H x W is 540x640), concat3 RGB.
+- Model spatial bucket: 736x544 W x H (tensor H x W is 544x736).
 - VAE encode chunk: 8 frames; exact duration: 33.
 - `torch.compile`: disabled; deterministic model seed: 0.
 - Default sampler: guidance 3.0, 4 UniPC steps, shift 5.0.
@@ -104,10 +105,10 @@ Raw results:
 /mnt/lixiangyu/cosmos_ws/RoboLab/output/robolab_full_w8_g1s2_smoke_20260711
 ```
 
-The replay error and smoke result together make guidance 3.0 / 2 steps the
-current sampler candidate for repeated rollout. It preserves CFG and had the
-lowest replay action error among accelerated settings. This is not yet evidence
-of quality parity.
+The replay error and smoke result motivated guidance 3.0 / 2 steps as the
+candidate for repeated rollout. It preserves CFG and had the lowest replay
+action error among accelerated settings. The 50-episode and multi-task gates
+below provide the closed-loop evidence used for the final decision.
 
 ## Training Calibration Protocol
 
@@ -152,57 +153,129 @@ Quantization changes memory much more than latency for these batch-one shapes.
 `gen_branch_w8` has the lowest action divergence among the W4/W8 mixed
 strategies. Open-loop error alone does not establish closed-loop quality.
 
-## Quantization Strategy Closed-Loop Rollout
+## Paired 50-Episode Quantization Gate
 
-The four processes used the same protocol and were run concurrently on one
-eight-GPU RTX 4090 machine. Each policy server and IsaacSim process had its own
-physical GPU.
+The earlier five-episode rollout was a connectivity smoke and produced an
+unstable ranking. The release comparison below uses 50 paired initial states.
+Every server and simulator had an exclusive physical RTX 4090.
 
 ```text
 task: BananaInBowlTask
-instruction: Pick up the banana and place it in the bowl
-episodes per strategy: 5
+episodes per strategy: 50
 num_envs: 1
 max episode steps: 750
 RoboLab process seed: 0
+model seed: 0 for every request
 action chunk: 32 x 8
 guidance/steps: 3.0/4
 ```
 
-| Strategy | Success | Episode steps by run | Successful completion median | Server requests | Request p50/p95 | Policy time / simulator step |
-|---|---:|---|---:|---:|---:|---:|
-| `full_w8` | 5/5 | 237, 159, 284, 155, 381 | 237 | 39 | 4104/4120ms | 155.6ms |
-| `full_w4` | 2/5 | 750F, 166, 750F, 220, 750F | 193 | 85 | 4237/4243ms | 159.4ms |
-| `attention_w8` | 5/5 | 247, 189, 462, 329, 375 | 329 | 52 | 4147/4156ms | 158.2ms |
-| `gen_branch_w8` | 5/5 | 311, 179, 118, 152, 223 | 179 | 32 | 4089/4096ms | 156.5ms |
+All 200 HDF5 initial-state hashes matched by run across the four strategies.
+The hash includes robot, object, and camera state. Confidence intervals are
+Wilson 95% intervals. A paired win means the candidate succeeded when
+`full_w8` failed; a paired loss means the reverse. The p-value is an exact
+two-sided McNemar test and is not adjusted for multiple comparisons.
 
-`F` marks a timeout failure at the 750-step horizon. Server request latency is
-from each rollout server's request profile. Policy time per simulator step is
-`sum(policy_inference_s) / sum(episode_step)` and includes client-side image
-preparation, serialization, and transport that are outside the server timer.
-Different request counts are a consequence of different episode lengths, with
-one policy request approximately every 32 simulator steps.
+| Strategy | Success (Wilson 95% CI) | Successful step median | Paired wins/losses | McNemar p | Episode wall p50 | 50-episode wall |
+|---|---:|---:|---:|---:|---:|---:|
+| `full_w8` | 43/50 = 0.86 [0.738, 0.930] | 213 | reference | - | 78.9s | 85.6min |
+| `full_w4` | 26/50 = 0.52 [0.385, 0.652] | 292.5 | 4/21 | 0.00091 | 203.4s | 140.6min |
+| `attention_w8` | 42/50 = 0.84 [0.715, 0.917] | 373.5 | 4/5 | 1.000 | 137.4s | 115.3min |
+| `gen_branch_w8` | 45/50 = 0.90 [0.786, 0.957] | 208 | 6/4 | 0.754 | 81.1s | 81.8min |
 
-The five-episode result is sufficient to reject `full_w4` as the default for
-this task: its memory advantage came with three observed closed-loop failures.
-It is not sufficient to rank the other three strategies statistically; a 5/5
-result still has a wide success-rate confidence interval. Retain all three W8
-options and select by deployment memory budget:
+Wall time is the sum of per-episode wall time and excludes one-time model and
+IsaacSim startup. Failed episodes run to the 750-step horizon, so lower policy
+quality also increases total evaluation time.
 
-- `full_w8`: quality-first reference; highest memory, still below 24GB.
-- `gen_branch_w8`: current balanced default; 18.03GB peak reserved and the
-  lowest mixed-precision replay error.
-- `attention_w8`: memory-focused retained option; 16.21GB peak reserved.
-- `full_w4`: experimental memory floor only; it failed this rollout gate.
+| Strategy | Peak alloc/reserved | Request p50/p95 | Generate p50/p95 | Policy time / simulator step |
+|---|---:|---:|---:|---:|
+| `full_w8` | 20.95/21.42GB | 4110/4120ms | 4071/4080ms | 157.0ms |
+| `full_w4` | 14.23/14.67GB | 4248/4257ms | 4207/4214ms | 159.3ms |
+| `attention_w8` | 15.69/16.21GB | 4153/4162ms | 4111/4118ms | 156.2ms |
+| `gen_branch_w8` | 17.59/18.03GB | 4104/4116ms | 4062/4071ms | 156.6ms |
 
-Guidance 3.0 / two steps remains a separate latency candidate. Its one-episode
-smoke is not enough to combine it with a quantization recommendation yet.
+Quantization changes memory, not request latency, at these batch-one shapes.
+`full_w4` is statistically and operationally worse than `full_w8` on this
+task. The three W8-containing strategies are not distinguishable by 50 Banana
+episodes alone.
+
+## Paired 50-Episode Sampler Gate
+
+The sampler gate fixes the bundle to `full_w8`. Initial-state hashes matched
+for all 50 runs across all four settings.
+
+| Guidance | Steps | Success (Wilson 95% CI) | Paired wins/losses vs g3/s4 | McNemar p | Request p50/p95 | Episode wall p50 | Total wall / speedup |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 3.0 | 4 | 43/50 = 0.86 [0.738, 0.930] | reference | - | 4110/4120ms | 78.9s | 85.6min / 1.00x |
+| 3.0 | 2 | 45/50 = 0.90 [0.786, 0.957] | 5/3 | 0.727 | 2403/2413ms | 67.0s | 71.8min / 1.19x |
+| 1.0 | 4 | 32/50 = 0.64 [0.501, 0.759] | 3/14 | 0.0127 | 2431/2440ms | 93.0s | 98.0min / 0.87x |
+| 1.0 | 2 | 40/50 = 0.80 [0.670, 0.888] | 5/8 | 0.581 | 1565/1574ms | 111.7s | 101.1min / 0.85x |
+
+Guidance 3.0 / two steps is the only retained accelerated sampler. It reduces
+request latency by 1.71x while preserving CFG and did not show a quality loss.
+Its end-to-end speedup is 1.19x because rendering/environment work remains and
+its successful trajectory median increased from 213 to 239 steps. Removing CFG
+reduced request latency but caused enough failures and longer trajectories to
+make both guidance-1 settings slower end to end.
+
+## Quantization And Sampler Interaction
+
+Quantization and denoising controls are independent runtime knobs but are not
+quality-orthogonal. All rows use guidance 3.0 / two steps and the same 50
+paired Banana initial states.
+
+| Strategy | Success (Wilson 95% CI) | Successful step median | Paired wins/losses vs full-W8 | McNemar p | Request p50/p95 | Peak reserved | Episode p50 / total wall |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `full_w8` | 45/50 = 0.90 [0.786, 0.957] | 239 | reference | - | 2403/2413ms | 21.42GB | 67.0s / 71.8min |
+| `gen_branch_w8` | 50/50 = 1.00 [0.929, 1.000] | 219 | 5/0 | 0.0625 | 2433/2442ms | 18.03GB | 59.2s / 54.1min |
+| `attention_w8` | 39/50 = 0.78 [0.648, 0.872] | 348 | 4/10 | 0.180 | 2422/2433ms | 16.21GB | 106.7s / 97.1min |
+
+`gen_branch_w8` is a strong Banana-specific configuration, but the cross-task
+test below shows that its 50/50 result does not generalize. `attention_w8` lost
+quality when combined with the two-step sampler and is not retained for that
+combination.
+
+## Paired Multi-Task Coverage
+
+Three configurations were evaluated on 10 paired runs of three DROID-aligned
+RoboLab tasks. The task horizons were 600 steps for RubiksCube, 450 for
+MustardInRightBin, and 900 for SpoonInMug. All 90 initial-state hashes matched.
+
+| Strategy / sampler | RubiksCube | MustardInRightBin | SpoonInMug | Aggregate (Wilson 95% CI) | Aggregate wall |
+|---|---:|---:|---:|---:|---:|
+| `full_w8` g3/s4 | 10/10 | 8/10 | 4/10 | 22/30 = 0.73 [0.556, 0.858] | 96.5min |
+| `full_w8` g3/s2 | 10/10 | 8/10 | 7/10 | 25/30 = 0.83 [0.664, 0.927] | 70.5min |
+| `gen_branch_w8` g3/s2 | 10/10 | 6/10 | 1/10 | 17/30 = 0.57 [0.392, 0.726] | 99.8min |
+
+For `full_w8`, g3/s2 had seven paired wins and four losses against g3/s4
+across the 30 runs (McNemar p=0.549). There is no observed cross-task quality
+penalty, while aggregate wall time fell by 1.37x. Against `full_w8` g3/s2,
+`gen_branch_w8` had two paired wins and ten losses (p=0.0386); on Spoon alone
+it had zero wins and six losses (p=0.0313). The mixed strategy is therefore not
+a general RoboLab default.
+
+## Deployment Selection
+
+| Scope | Recommended configuration | Evidence and tradeoff |
+|---|---|---|
+| General RoboLab default | `full_w8`, guidance 3.0, 2 steps | 21.42GB reserved; Banana 45/50; multi-task 25/30; ~2.4s request |
+| Conservative rollback | `full_w8`, guidance 3.0, 4 steps | No sampler approximation; ~4.1s request; multi-task 22/30 |
+| Validated Banana-only deployment | `gen_branch_w8`, guidance 3.0, 2 steps | 18.03GB; Banana 50/50; not transferable without per-task rollout |
+| Low-memory Banana option | `attention_w8`, guidance 3.0, 4 steps | 16.21GB; Banana 42/50; longer trajectories |
+| Experimental only | `full_w4` | 14.67GB but Banana 26/50; failed paired quality gate |
+
+Do not deploy guidance 1.0 from these results. Do not choose a quantization
+strategy from replay error alone. For a new task or robot, roll back to
+`full_w8` g3/s4, validate replay and paired closed-loop behavior, then enable
+g3/s2 and any mixed strategy independently.
 
 Raw artifacts:
 
 ```text
 /mnt/lixiangyu/cosmos_ws/robolab_validation/replay/benchmark_<strategy>_g3s4_replay8
-/mnt/lixiangyu/cosmos_ws/robolab_validation/runs/benchmark_<strategy>_g3s4_replay8
-/mnt/lixiangyu/cosmos_ws/robolab_validation/runs/rollout5_<strategy>_g3s4
-/mnt/lixiangyu/cosmos_ws/RoboLab/output/robolab_<strategy>_g3s4_rollout5_20260711
+/mnt/lixiangyu/cosmos_ws/robolab_validation/runs/q50_<strategy>_g3s4_20260711_r1
+/mnt/lixiangyu/cosmos_ws/robolab_validation/runs/s50_full_w8_<sampler>_20260711
+/mnt/lixiangyu/cosmos_ws/robolab_validation/runs/i50_<strategy>_g3s2_20260711
+/mnt/lixiangyu/cosmos_ws/robolab_validation/runs/mt_<strategy>_<sampler>_20260711
+/mnt/lixiangyu/cosmos_ws/RoboLab/output/robolab_<matching-run-name>
 ```
