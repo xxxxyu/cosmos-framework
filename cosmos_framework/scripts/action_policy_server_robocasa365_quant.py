@@ -206,6 +206,7 @@ class ServerConfig:
     quant_calib_skip: int
     quant_calib_limit: int
     quant_calib_alpha: float
+    quant_calibration_stats_output: str
     quant_export_dir: str
     quant_import_dir: str
     allow_legacy_quant_artifact: bool
@@ -496,6 +497,8 @@ class CosmosRoboCasa365Policy:
             self._apply_linear_backend_replacement(cfg)
         if cfg.quant_export_dir:
             self._export_quant_artifacts(cfg)
+        if cfg.quant_calibration_stats_output:
+            self._collect_direct_quant_calibration(cfg)
         _profile_event("policy_init", elapsed_ms=_sync_elapsed_ms(init_start))
         log.info(
             "[robocasa365-rldx-server] ready "
@@ -1035,6 +1038,77 @@ class CosmosRoboCasa365Policy:
         )
         return input_scales
 
+    def _collect_direct_quant_calibration(self, cfg: ServerConfig) -> None:
+        if not cfg.quant_import_dir:
+            raise ValueError("--quant-calibration-stats-output requires --quant-import-dir")
+        capture_dir = Path(cfg.quant_calib_capture_dir).expanduser()
+        request_files = sorted(capture_dir.glob("sample_*.request.msgpack"))
+        if cfg.quant_calib_skip > 0:
+            request_files = request_files[cfg.quant_calib_skip :]
+        if cfg.quant_calib_limit > 0:
+            request_files = request_files[: cfg.quant_calib_limit]
+        if not request_files:
+            raise FileNotFoundError(f"No calibration request files found in {capture_dir}")
+
+        stats: dict[str, torch.Tensor] = {}
+        hook_handles: list[Any] = []
+
+        def make_hook(name: str) -> Any:
+            def hook(_module: nn.Module, inputs: tuple[Any, ...]) -> None:
+                if not inputs or not isinstance(inputs[0], torch.Tensor) or inputs[0].numel() == 0:
+                    return
+                x = inputs[0].detach().reshape(-1, inputs[0].shape[-1]).abs()
+                value = x.amax(dim=0).float().cpu()
+                previous = stats.get(name)
+                stats[name] = value if previous is None else torch.maximum(previous, value)
+
+            return hook
+
+        for module in self.model.modules():
+            if isinstance(module, QuantLinearWithOptionalBias):
+                name = str(module.profile_name)
+                hook_handles.append(module.register_forward_pre_hook(make_hook(name)))
+        if len(hook_handles) != 504:
+            raise ValueError(f"Expected 504 direct-quant calibration hooks, found {len(hook_handles)}")
+
+        calibration_start = time.perf_counter()
+        processed_requests = 0
+        try:
+            with torch.inference_mode():
+                for request_file in request_files:
+                    request = MsgSerializer.from_bytes(request_file.read_bytes())
+                    if not isinstance(request, dict):
+                        raise TypeError(f"Calibration request must contain a dict: {request_file}")
+                    data = request.get("data", {})
+                    if not isinstance(data, dict):
+                        raise TypeError(f"Calibration request data must contain a dict: {request_file}")
+                    observation = data.get("observation")
+                    options = data.get("options")
+                    if not isinstance(observation, dict):
+                        raise TypeError(f"Calibration request has no observation dict: {request_file}")
+                    self.get_action(observation, options if isinstance(options, dict) else None)
+                    processed_requests += 1
+        finally:
+            for handle in hook_handles:
+                handle.remove()
+        if len(stats) != 504:
+            raise ValueError(f"Calibration exercised {len(stats)} of 504 quantized Linear modules")
+
+        output_path = Path(cfg.quant_calibration_stats_output).expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = output_path.with_name(f".{output_path.name}.tmp-{os.getpid()}")
+        torch.save(dict(sorted(stats.items())), temp_path)
+        os.replace(temp_path, output_path)
+        _profile_event(
+            "direct_quant_calibration",
+            capture_dir=str(capture_dir),
+            requested=len(request_files),
+            processed=processed_requests,
+            modules=len(stats),
+            output_path=str(output_path),
+            elapsed_ms=_sync_elapsed_ms(calibration_start),
+        )
+
     def _build_setup_args(self, cfg: ServerConfig, config_file: str) -> OmniSetupArgs:
         overrides = OmniSetupOverrides.model_validate(
             {
@@ -1286,6 +1360,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quant-calib-skip", type=int, default=0)
     parser.add_argument("--quant-calib-limit", type=int, default=0)
     parser.add_argument("--quant-calib-alpha", type=float, default=0.5)
+    parser.add_argument("--quant-calibration-stats-output", default="")
     parser.add_argument("--quant-export-dir", default="")
     parser.add_argument("--quant-import-dir", default="")
     parser.add_argument("--allow-legacy-quant-artifact", action="store_true")
@@ -1345,6 +1420,7 @@ def main() -> None:
         quant_calib_skip=args.quant_calib_skip,
         quant_calib_limit=args.quant_calib_limit,
         quant_calib_alpha=args.quant_calib_alpha,
+        quant_calibration_stats_output=args.quant_calibration_stats_output,
         quant_export_dir=args.quant_export_dir,
         quant_import_dir=args.quant_import_dir,
         allow_legacy_quant_artifact=args.allow_legacy_quant_artifact,

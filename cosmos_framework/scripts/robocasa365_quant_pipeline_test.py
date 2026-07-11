@@ -15,10 +15,45 @@ from cosmos_framework.scripts.robocasa365_quant_bundle import (
 )
 from cosmos_framework.scripts.robocasa365_quant_pipeline import (
     STRATEGIES,
+    _calibration_input_scale,
+    _is_quantizable_linear,
     serve_command,
     validate_quant_artifact,
     write_strategy_configs,
 )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "net.language_model.model.layers.0.self_attn.q_proj",
+        "net.language_model.model.layers.35.self_attn.o_proj_moe_gen",
+        "net.language_model.model.layers.4.mlp.down_proj",
+        "net.language_model.model.layers.9.mlp_moe_gen.gate_proj",
+    ],
+)
+def test_stream_export_linear_filter_accepts_mot_linears(name: str) -> None:
+    assert _is_quantizable_linear(name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "net.language_model.model.layers.0.input_layernorm",
+        "net.language_model.model.layers.0.self_attn.q_norm_moe_gen",
+        "net.language_model.model.embed_tokens",
+        "net.time_embedder.mlp.0",
+    ],
+)
+def test_stream_export_linear_filter_rejects_non_targets(name: str) -> None:
+    assert not _is_quantizable_linear(name)
+
+
+def test_calibration_scale_rejects_wrong_channel_count() -> None:
+    torch = pytest.importorskip("torch")
+
+    with pytest.raises(ValueError, match="expected 4"):
+        _calibration_input_scale(torch.ones(3), size_k=4, alpha=0.5)
 
 
 def _write_minimal_artifact(root: Path, *, backend_class: str = "VllmGptqMarlinW4A16Linear") -> None:

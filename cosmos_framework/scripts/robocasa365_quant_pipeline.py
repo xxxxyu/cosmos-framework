@@ -16,9 +16,14 @@ The heavy lifting is done by ``action_policy_server_robocasa365_quant.py``.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import os
 import re
 import shlex
+import shutil
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -38,6 +43,220 @@ _BACKEND_CLASSES = {
     "vllm_gptq_marlin_w8a16": "VllmGptqMarlinW8A16Linear",
 }
 _SUPPORTED_FORMATS = {"vllm_marlin_wna16"}
+_QUANTIZABLE_LINEAR_RE = re.compile(
+    r"\.((self_attn\.(q|k|v|o)_proj(_moe_gen)?)|"
+    r"(mlp(_moe_gen)?\.(gate|up|down)_proj))$"
+)
+
+
+def _load_quant_backend_module() -> Any:
+    module_path = Path(__file__).with_name("quant_backend_microbench.py")
+    spec = importlib.util.spec_from_file_location("cosmos3_stream_quant_backends", module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not import quant backend module from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_input_amax(path: str | Path | None) -> dict[str, Any]:
+    if path is None:
+        return {}
+    import torch
+
+    loaded = torch.load(Path(path).expanduser(), map_location="cpu", weights_only=True)
+    if not isinstance(loaded, dict):
+        raise TypeError("Calibration stats must map module names to one-dimensional tensors")
+    result = {}
+    for name, value in loaded.items():
+        if not isinstance(name, str) or not isinstance(value, torch.Tensor) or value.ndim != 1:
+            raise TypeError(f"Invalid calibration entry for {name!r}")
+        result[name] = value.detach().float().cpu()
+    return result
+
+
+def _calibration_input_scale(values: Any, *, size_k: int, alpha: float) -> Any:
+    import torch
+
+    if values.numel() != size_k:
+        raise ValueError(f"Calibration vector has {values.numel()} channels, expected {size_k}")
+    values = values.clamp(min=1e-6)
+    normalized = values / values.mean().clamp(min=1e-6)
+    return normalized.pow(alpha).clamp(min=1e-2, max=1e2).to(torch.bfloat16)
+
+
+def _is_quantizable_linear(module_name: str) -> bool:
+    """Match the 14 Linear module types in each Cosmos3 Nano MoT layer."""
+
+    return _QUANTIZABLE_LINEAR_RE.search(module_name) is not None
+
+
+def stream_export_packed_artifact(
+    *,
+    strategy_name: str,
+    checkpoint_path: str | Path,
+    output_dir: str | Path,
+    device: str = "cuda:0",
+    calibration_stats: str | Path | None = None,
+    calibration_alpha: float = 0.5,
+    max_cpu_batch_size_bytes: int = 1024**3,
+) -> dict[str, Any]:
+    """Stream DCP tensors through one GPU Linear at a time into a schema-v1 artifact."""
+
+    import torch
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.filesystem import FileSystemReader
+    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
+
+    strategy = _strategy(strategy_name)
+    checkpoint_root = Path(checkpoint_path).expanduser().resolve()
+    output_root = Path(output_dir).expanduser().resolve()
+    if output_root.exists():
+        raise FileExistsError(f"Refusing to overwrite packed quant artifact: {output_root}")
+    if not (checkpoint_root / ".metadata").is_file():
+        raise FileNotFoundError(f"DCP metadata does not exist: {checkpoint_root / '.metadata'}")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required to pack Marlin weights")
+    cuda_device = torch.device(device)
+    if cuda_device.type != "cuda":
+        raise ValueError(f"Marlin packing device must be CUDA, got {device!r}")
+    device_index = cuda_device.index if cuda_device.index is not None else torch.cuda.current_device()
+    torch.cuda.set_device(device_index)
+    torch.cuda.reset_peak_memory_stats(device_index)
+
+    reader = FileSystemReader(str(checkpoint_root))
+    checkpoint_metadata = reader.read_metadata()
+    targets: list[tuple[str, str, str, TensorStorageMetadata]] = []
+    for key, metadata in checkpoint_metadata.state_dict_metadata.items():
+        if not key.endswith(".weight") or not isinstance(metadata, TensorStorageMetadata):
+            continue
+        module_name = key.removesuffix(".weight")
+        if not _is_quantizable_linear(module_name):
+            continue
+        backend_name = _backend_for_name(strategy.plan, module_name)
+        backend_class = _BACKEND_CLASSES.get(backend_name)
+        if backend_class is not None:
+            targets.append((key, module_name, backend_class, metadata))
+    targets.sort(key=lambda item: item[0])
+    if len(targets) != 504:
+        raise ValueError(f"Expected 504 quantized DCP Linear weights, found {len(targets)}")
+
+    stats = _load_input_amax(calibration_stats)
+    w4_names = {name for _key, name, backend, _meta in targets if _BACKEND_BITS[backend] == 4}
+    missing_stats = sorted(w4_names - set(stats))
+    if missing_stats:
+        raise ValueError(
+            f"Strategy {strategy_name!r} requires calibration stats for {len(w4_names)} W4 modules; "
+            f"{len(missing_stats)} are missing"
+        )
+
+    temp_root = output_root.with_name(f".{output_root.name}.tmp-{os.getpid()}")
+    temp_root.mkdir(parents=True)
+    (temp_root / "tensors").mkdir()
+    backend_module = _load_quant_backend_module()
+    modules: list[dict[str, Any]] = []
+    try:
+        batches: list[list[tuple[str, str, str, TensorStorageMetadata]]] = []
+        current: list[tuple[str, str, str, TensorStorageMetadata]] = []
+        current_bytes = 0
+        for target in targets:
+            metadata = target[3]
+            numel = 1
+            for dim in metadata.size:
+                numel *= int(dim)
+            size = numel * metadata.properties.dtype.itemsize
+            if current and current_bytes + size > max_cpu_batch_size_bytes:
+                batches.append(current)
+                current = []
+                current_bytes = 0
+            current.append(target)
+            current_bytes += size
+        if current:
+            batches.append(current)
+
+        for batch in batches:
+            tensors = {
+                key: torch.empty(tuple(metadata.size), dtype=metadata.properties.dtype, device="cpu")
+                for key, _name, _backend, metadata in batch
+            }
+            dcp.load(state_dict=tensors, storage_reader=reader)
+            for key, module_name, backend_class, _metadata in batch:
+                weight = tensors.pop(key).to(device=device, dtype=torch.bfloat16)
+                bits = _BACKEND_BITS[backend_class]
+                if bits == 8:
+                    backend = backend_module.VllmGptqMarlinW8A16Linear(weight)
+                else:
+                    input_scale = _calibration_input_scale(
+                        stats[module_name], size_k=int(weight.shape[1]), alpha=calibration_alpha
+                    )
+                    backend = backend_module.VllmGptqMarlinW4A16Linear(weight, input_scale=input_scale)
+                payload = {
+                    "backend_class": backend_class,
+                    "bias": None,
+                    "qweight": backend.qweight.detach().cpu().contiguous(),
+                    "scales": backend.scales.detach().cpu().contiguous(),
+                    "input_scale": (
+                        backend.input_scale.detach().cpu().contiguous()
+                        if isinstance(getattr(backend, "input_scale", None), torch.Tensor)
+                        else None
+                    ),
+                }
+                safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", module_name)
+                rel_path = f"tensors/{safe_name}.pt"
+                torch.save(payload, temp_root / rel_path)
+                modules.append(
+                    {
+                        "name": module_name,
+                        "backend_class": backend_class,
+                        "format": "vllm_marlin_wna16",
+                        "num_bits": bits,
+                        "group_size": int(backend.group_size),
+                        "size_k": int(backend.size_k),
+                        "size_n": int(backend.size_n),
+                        "wtype_id": int(backend.wtype_id),
+                        "tensor_file": rel_path,
+                    }
+                )
+                del payload, backend, weight
+                torch.cuda.empty_cache()
+            del tensors
+
+        torch.cuda.synchronize(device_index)
+        peak_allocated_bytes = int(torch.cuda.max_memory_allocated(device_index))
+        peak_reserved_bytes = int(torch.cuda.max_memory_reserved(device_index))
+        manifest = {
+            "schema_version": 1,
+            "created_unix": time.time(),
+            "checkpoint_path": str(checkpoint_root),
+            "quant_plan_file": "",
+            "quant_backend": "none",
+            "quant_target_prefix": "net.language_model.model.layers",
+            "calibration": {
+                "required": bool(w4_names),
+                "stats_supplied": calibration_stats is not None,
+                "stats_modules": len(stats),
+                "alpha": calibration_alpha,
+            },
+            "streaming_export": {
+                "enabled": True,
+                "max_cpu_batch_size_bytes": max_cpu_batch_size_bytes,
+                "gpu_full_model_loaded": False,
+                "peak_cuda_allocated_bytes": peak_allocated_bytes,
+                "peak_cuda_reserved_bytes": peak_reserved_bytes,
+            },
+            "modules": sorted(modules, key=lambda item: item["name"]),
+        }
+        (temp_root / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        os.replace(temp_root, output_root)
+    except BaseException:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        raise
+
+    result = validate_quant_artifact(output_root, expected_strategy=strategy_name, check_tensors=True)
+    summary = {key: value for key, value in result.items() if key != "manifest"}
+    summary["streaming_export"] = manifest["streaming_export"]
+    return summary
 
 
 @dataclass(frozen=True)
@@ -365,6 +584,19 @@ def build_bundle_command(args: argparse.Namespace) -> None:
     print(json.dumps({k: v for k, v in result.items() if k != "manifest"}, indent=2, sort_keys=True))
 
 
+def stream_export_command(args: argparse.Namespace) -> None:
+    result = stream_export_packed_artifact(
+        strategy_name=args.strategy,
+        checkpoint_path=args.checkpoint_path,
+        output_dir=args.output_dir,
+        device=args.device,
+        calibration_stats=args.calibration_stats,
+        calibration_alpha=args.calibration_alpha,
+        max_cpu_batch_size_bytes=int(args.max_cpu_batch_size_gb * 1024**3),
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
 def export_command(args: argparse.Namespace) -> str:
     if not args.checkpoint_path or not args.config_file:
         raise ValueError("Quant export requires --checkpoint-path and --config-file")
@@ -530,6 +762,16 @@ def parse_args() -> argparse.Namespace:
     bundle.add_argument("--copy-mode", choices=["copy", "hardlink"], default="copy")
     bundle.add_argument("--max-shard-size-gb", type=float, default=2.0)
     bundle.set_defaults(func=build_bundle_command)
+
+    stream_export = sub.add_parser("stream-export-packed")
+    stream_export.add_argument("--strategy", required=True, choices=sorted(STRATEGIES))
+    stream_export.add_argument("--checkpoint-path", required=True)
+    stream_export.add_argument("--output-dir", required=True)
+    stream_export.add_argument("--device", default="cuda:0")
+    stream_export.add_argument("--calibration-stats")
+    stream_export.add_argument("--calibration-alpha", type=float, default=0.5)
+    stream_export.add_argument("--max-cpu-batch-size-gb", type=float, default=1.0)
+    stream_export.set_defaults(func=stream_export_command)
 
     common_model = argparse.ArgumentParser(add_help=False)
     common_model.add_argument("--python", default="python")

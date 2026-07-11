@@ -3,12 +3,13 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 
 set -euo pipefail
+export COSMOS_TRAINING=0
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
 
 export COSMOS_REPO="${COSMOS_REPO:-$repo_root}"
-export COSMOS_PYTHON="${COSMOS_PYTHON:-$COSMOS_REPO/.venv/bin/python}"
+export COSMOS_PYTHON="${COSMOS_PYTHON:-$COSMOS_REPO/examples/quantized_robot_policy/.venv/bin/python}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export HOST="${HOST:-127.0.0.1}"
 export PORT="${PORT:-5577}"
@@ -23,7 +24,11 @@ export NSYS_BIN="${NSYS_BIN:-nsys}"
 export NCU_BIN="${NCU_BIN:-ncu}"
 export NCU_KERNEL_NAME="${NCU_KERNEL_NAME:-regex:.*marlin::Marlin.*}"
 export RUN_DIR="${RUN_DIR:-/tmp/cosmos3_robocasa365_quant_profile_$(date +%Y%m%d_%H%M%S)}"
-export PYTHONPATH="$COSMOS_REPO:$COSMOS_REPO/packages/transformers-cosmos3:$COSMOS_REPO/packages/diffusers-cosmos3:$COSMOS_REPO/packages/vllm-cosmos3:${PYTHONPATH:-}"
+
+if [[ ! -x "$COSMOS_PYTHON" ]]; then
+  echo "quant runtime is missing; run examples/quantized_robot_policy/setup.sh" >&2
+  exit 2
+fi
 
 : "${QUANT_BUNDLE_DIR:?set QUANT_BUNDLE_DIR to a self-contained schema-v2 quant bundle}"
 : "${REPLAY_CAPTURE_DIR:?set REPLAY_CAPTURE_DIR to the captured replay request directory}"

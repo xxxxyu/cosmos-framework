@@ -11,7 +11,7 @@ The server uses OpenPI's WebsocketPolicyServer and speaks its msgpack+NumPy prot
 
 Example:
 
-  PYTHONPATH=. python -m cosmos_framework.scripts.action_policy_server_robolab \
+  python -m cosmos_framework.scripts.action_policy_server_robolab \
     --checkpoint-path nvidia/Cosmos3-Nano-Policy-DROID \
     --port 8000
 """

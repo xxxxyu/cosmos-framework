@@ -261,6 +261,7 @@ def build_robolab_quant_bundle(
     allow_uncalibrated_w4: bool = False,
     copy_mode: str = "copy",
     max_residual_shard_size: int = 2 * 1024**3,
+    source_provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Stream a Diffusers DROID checkpoint into one deployable packed bundle."""
 
@@ -455,6 +456,7 @@ def build_robolab_quant_bundle(
                 "checkpoint_path": str(source_root),
                 "tokenizer_dir": str(tokenizer_source),
                 "vae_path": str(vae_source),
+                "provenance": source_provenance or {},
             },
             "quantization": {
                 "strategy": strategy,
