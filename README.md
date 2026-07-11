@@ -86,6 +86,8 @@ python -m cosmos_framework.scripts.inference \
 ## Policy Server
 
 See [Policy Server](./docs/action_policy_droid_server.md) for the full guide.
+For packed W4A16/W8A16 deployment on a single 24GB RTX 4090, start with the
+[Quantized Robot Policy Runtime](./examples/quantized_robot_policy/README.md).
 
 ## Reference
 
@@ -96,4 +98,5 @@ See [Policy Server](./docs/action_policy_droid_server.md) for the full guide.
 | [Training](./docs/training.md)                               | Launching multi-GPU and multi-node runs; parallelism strategies; mixed precision; resuming.                              |
 | [Inference (from a trained checkpoint)](./docs/inference.md) | Loading a trained checkpoint into one of the inference backends.                                                         |
 | [Policy Server](./docs/action_policy_droid_server.md)        | Running the server-client pipeline for Cosmos3-Nano-Policy-DROID.                                                        |
+| [Quantized Robot Policies](./examples/quantized_robot_policy/README.md) | Self-contained RoboCasa365 and RoboLab W4A16/W8A16 build, validation, replay, rollout, and 4090 benchmarks.             |
 | [FAQ](./docs/faq.md)                                         | Troubleshooting (OOM, NCCL hangs, slow training), environment variables, and common pitfalls.                            |

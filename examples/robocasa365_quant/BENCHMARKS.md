@@ -2,9 +2,9 @@
 
 This document is the deployment-oriented benchmark record for the Cosmos 3
 Nano CloseFridge policy. It compares closed-loop success, model memory, replay
-latency, quantization strategies, and denoising settings. For setup and artifact
-commands, see `README.md`; for the release gate and real-robot handoff, see
-`RELEASE_TESTING.md`.
+latency, quantization strategies, and denoising settings. For setup, artifact,
+replay, and rollout commands, see `README.md`; for the tag gate, see
+`../quantized_robot_policy/RELEASE_CHECKLIST.md`.
 
 ## Scope and Measurement Rules
 
@@ -32,6 +32,27 @@ Do not compare absolute latency across H100 and RTX 4090, across different
 software stacks, or between `N_ENVS=5` rollout and single-request replay. Use
 only rows in the same table/runtime environment for latency ranking.
 
+## V0.3 Release Pipeline Smoke
+
+The release entry point was rebuilt from the 8,000-step BF16 DCP on one RTX
+4090. This gate validates the product pipeline itself; the larger rollout
+tables below remain the quality evidence.
+
+| Strategy | Calibration | Packed modules | Bundle bytes | Stream-pack peak alloc/reserved |
+|---|---:|---:|---:|---:|
+| `full_w8` | not required | 0 W4 / 504 W8 | 19,292,105,862 | 0.654/0.656GB |
+| `attention_w8` | 128 training captures | 216 W4 / 288 W8 | 14,025,041,490 | 0.808/1.034GB |
+
+Both one-command builds completed residual conversion and strong hash/tensor
+validation. The mixed build first direct-loaded a temporary W8 model under
+24GB, exercised all 504 Linear hooks on all 128 CloseFridge training requests,
+then removed every temporary packed artifact and calibration-stat file.
+
+The newly built `full_w8` bundle returned finite actions for 2/2 replay
+requests. Post-load memory was 17.88GB allocated; peak inference memory was
+19.21/19.58GB allocated/reserved. The one steady measured generation took
+1,107ms; use the larger latency samples below for deployment estimates.
+
 ## Quantization Strategies
 
 | Strategy | W4 modules | W8 modules | Precision map | Deployment role |
@@ -41,10 +62,11 @@ only rows in the same table/runtime environment for latency ranking.
 | `attention_w8` | 216 | 288 | All self-attention W8A16, MLP W4A16 | Recommended memory/quality balance |
 | `gen_branch_w8` | 252 | 252 | MoT generation branch W8A16, remainder W4A16 | Intermediate memory option |
 
-All four strategies use training-set calibration during export: 128
+Every W4-containing strategy uses training-set calibration during export: 128
 CloseFridge frames, activation-aware input-channel scaling, and `alpha=0.5`.
-Calibration frames and RGB videos came from the RoboCasa365 training split,
-not the evaluation captures. Activation quantization is not enabled.
+`full_w8` has no calibration-dependent input scaling. Calibration frames and
+RGB videos came from the RoboCasa365 training split, not evaluation captures.
+Activation quantization is not enabled.
 
 ## H100 Closed-Loop Quality Gate
 
@@ -89,7 +111,8 @@ Interpretation:
 - The H100 Marlin path reduced memory but was not faster than BF16. The 4090
   measurements below are the relevant deployment latency results.
 
-Raw results:
+Internal provenance paths from the original cluster runs follow. They are not
+deployment inputs:
 
 ```text
 /mnt/100T/lixiangyu/cosmos3_robocasa365_opt/rollouts/m12_aigc28_*_50eps_max1200_20260707_140500
@@ -152,7 +175,7 @@ Short H100 rollout gate, 5 episodes per setting:
 | 3.0 | 2 | 5/5 | 430/445ms |
 | 1.0 | 2 | 4/5 | 242/262ms |
 
-Replay artifact:
+Internal replay provenance (not a deployment input):
 
 ```text
 /home/lixiangyu/cosmos_ws/local_4090_validation/logs/guidance_step_gate_20260709_003628
@@ -184,7 +207,7 @@ VIEW_MODE: concat3
 | `full_w8` | 3.0 | 2 | 42/50 = 0.84 | [0.715, 0.917] | 472/495ms | 460/479ms |
 | `full_w8` | 1.0 | 2 | 39/50 = 0.78 | [0.648, 0.872] | 304/318ms | 283/291ms |
 
-Run root:
+Internal rollout provenance (not a deployment input):
 
 ```text
 /mnt/lixiangyu/cosmos_ws/local_rollout/runs_nx/quant_matrix_20260710_233901
