@@ -53,6 +53,14 @@ requests. Post-load memory was 17.88GB allocated; peak inference memory was
 19.21/19.58GB allocated/reserved. The one steady measured generation took
 1,107ms; use the larger latency samples below for deployment estimates.
 
+A fresh Git checkout and fresh locked runtime on `4090-NX-1` then ran the
+public `pipeline.sh rollout` entry point with `attention_w8`, guidance 3.0,
+four steps, one environment, and the 1,200-step horizon. CloseFridge succeeded
+1/1; collection took 106.8s, the episode progress bar took 77.9s, steady
+generation was about 0.80-0.83s, and peak allocated/reserved memory was
+13.94/14.28GB. This single episode is a deployment smoke, not additional
+quality evidence.
+
 ## Quantization Strategies
 
 | Strategy | W4 modules | W8 modules | Precision map | Deployment role |
